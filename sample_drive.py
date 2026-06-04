@@ -26,9 +26,15 @@ shared_data = {
     'steering_input' : 0.0,
     'acceleration_input' : 1.0,
 
-    # Computer Vision 
+    # Computer Vision
     'detected_tokens': [],
+    'lane_centers': [],   # x-pixel of each detected lane center, left -> right
+    'current_lane': -1,   # index into lane_centers; -1 if unknown
+    'rear_vehicle_close': False,  # True when a fast car is closing in from behind
 
+    # Member 3 — driving logic decision (debug)
+    'target_lane': -1,
+    'decision_reason': 'init',
 }
 data_lock = threading.Lock()
 is_running = True
@@ -72,7 +78,7 @@ class RTTask(threading.Thread):
         except Exception as e:
             pass
 
-        next_release = time.pref_counter()
+        next_release = time.perf_counter()
         while is_running:
             self.run_count += 1
             start_time = time.perf_counter()
@@ -103,10 +109,10 @@ class RTTask(threading.Thread):
                     f"Miss={self.deadline_miss}"
                 )
 
-            sleep_time = self.period - exec_time
-
             if sleep_time > 0:
                 time.sleep(sleep_time)
+            else:
+                next_release = time.perf_counter()
             
 
 
@@ -311,6 +317,82 @@ def detect_tokens(frame):
 
     return detected_tokens
 
+def detect_lanes(frame):
+    """
+    Detect lane separator stripes and return:
+        lane_centers: list of x-pixel positions (left -> right) where the
+                      drivable lane *centers* are.
+        current_lane: index into lane_centers that the car is currently in,
+                      or -1 if it cannot be determined.
+
+    Strategy (top-down 2D racing view):
+      1. Take a horizontal strip near the bottom (where the car is).
+      2. Threshold for bright lane markings in HSV (low saturation, high value).
+      3. Sum the binary mask along Y to get a 1-D column profile.
+      4. Peaks in that profile = lane separator stripes.
+      5. Lane centers = midpoints between adjacent separators (and between
+         the outer separators and the image edges if the road fills the view).
+      6. Current lane = lane center closest to image center-bottom X.
+    """
+    height, width, _ = frame.shape
+
+    # ROI: a band near the bottom of the frame, in front of the car.
+    roi_y1 = int(height * 0.55)
+    roi_y2 = int(height * 0.90)
+    roi = frame[roi_y1:roi_y2, :]
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    # Lane markings are typically white / light: low saturation, high value.
+    lower = np.array([0, 0, 180])
+    upper = np.array([180, 60, 255])
+    mask = cv2.inRange(hsv, lower, upper)
+
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    # Column-wise sum: tall vertical stripes -> high values.
+    col_profile = mask.sum(axis=0).astype(np.float32)
+    if col_profile.max() <= 0:
+        return [], -1
+    col_profile /= col_profile.max()
+
+    # Find peaks: columns above threshold that are local maxima within a window.
+    peak_threshold = 0.4
+    min_separation_px = max(20, width // 20)
+    candidate_idx = np.where(col_profile > peak_threshold)[0]
+    if len(candidate_idx) == 0:
+        return [], -1
+
+    # Cluster consecutive bright columns into single separator peaks.
+    separators = []
+    cluster_start = candidate_idx[0]
+    prev = candidate_idx[0]
+    for x in candidate_idx[1:]:
+        if x - prev > min_separation_px:
+            separators.append((cluster_start + prev) // 2)
+            cluster_start = x
+        prev = x
+    separators.append((cluster_start + prev) // 2)
+
+    if len(separators) < 2:
+        return [], -1
+
+    # Lane centers = midpoints between adjacent separators.
+    lane_centers = []
+    for i in range(len(separators) - 1):
+        lane_centers.append((separators[i] + separators[i + 1]) // 2)
+
+    if not lane_centers:
+        return [], -1
+
+    # Current lane = whichever lane center is closest to the car (image bottom center).
+    car_x = width // 2
+    current_lane = int(np.argmin([abs(c - car_x) for c in lane_centers]))
+
+    return lane_centers, current_lane
+
+
 def processing_task():
     # Member 1: Get latest front camera frame
     with data_lock:
@@ -322,12 +404,41 @@ def processing_task():
     # Detect green, red, yellow tokens
     detected_tokens = detect_tokens(front_frame)
 
+    # Detect lane centers + which lane we are in
+    lane_centers, current_lane = detect_lanes(front_frame)
+
     # Save detection result for Member 3
     with data_lock:
         shared_data['detected_tokens'] = detected_tokens
+        shared_data['lane_centers'] = lane_centers
+        shared_data['current_lane'] = current_lane
 
     # Draw bounding boxes for demo/debugging
     debug_frame = front_frame.copy()
+    h_frame = debug_frame.shape[0]
+
+    # Draw lane centers (vertical green lines) and label the current lane.
+    for i, cx in enumerate(lane_centers):
+        line_color = (0, 200, 0) if i == current_lane else (180, 180, 180)
+        cv2.line(debug_frame, (cx, int(h_frame * 0.55)), (cx, h_frame - 1), line_color, 2)
+        cv2.putText(
+            debug_frame,
+            f"L{i}",
+            (cx - 10, int(h_frame * 0.58)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            line_color,
+            2,
+        )
+    cv2.putText(
+        debug_frame,
+        f"current_lane={current_lane}",
+        (10, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 0),
+        2,
+    )
 
     for token in detected_tokens:
         x, y, w, h = token['box']
@@ -355,21 +466,124 @@ def processing_task():
     cv2.imshow("Token Detection - Member 1", debug_frame)
     cv2.waitKey(1)
 
+def decide_target_lane(tokens, lane_centers, current_lane, rear_close, frame_h):
+    """
+    Member 3 — pick the best lane to be in.
+
+    Priority (high -> low):
+      1. Rear vehicle close       -> sidestep to an adjacent lane
+      2. Red/Yellow in current    -> move to a safer adjacent lane
+      3. Green in adjacent lane   -> grab it
+      4. Otherwise                -> hold current lane (or center if unknown)
+
+    Returns (target_lane_index, reason_str).
+    """
+    n_lanes = len(lane_centers)
+    if n_lanes == 0:
+        return -1, "no_lanes"
+
+    # If lane detection lost us, aim for the middle lane as a safe default.
+    if current_lane < 0:
+        return n_lanes // 2, "no_current_lane"
+
+    def lane_of(token_x):
+        # Assign a token to the nearest lane center.
+        return int(np.argmin([abs(token_x - c) for c in lane_centers]))
+
+    # Only consider tokens that are in front of us (upper portion of frame).
+    forward_cutoff = int(frame_h * 0.65)
+    forward_tokens = [t for t in tokens if t['y'] < forward_cutoff]
+
+    danger_in_lane = {i: False for i in range(n_lanes)}
+    green_in_lane = {i: False for i in range(n_lanes)}
+    for t in forward_tokens:
+        idx = lane_of(t['x'])
+        if t['color'] in ('red', 'yellow'):
+            danger_in_lane[idx] = True
+        elif t['color'] == 'green':
+            green_in_lane[idx] = True
+
+    adjacent = [i for i in (current_lane - 1, current_lane + 1) if 0 <= i < n_lanes]
+
+    # 1) Rear vehicle closing in -> swerve to an adjacent lane (prefer safer one).
+    if rear_close and adjacent:
+        safe = [i for i in adjacent if not danger_in_lane[i]]
+        if safe:
+            return safe[0], "rear_close_swerve"
+        return adjacent[0], "rear_close_forced"
+
+    # 2) Danger in current lane -> change lane.
+    if danger_in_lane[current_lane]:
+        safe = [i for i in adjacent if not danger_in_lane[i]]
+        if safe:
+            return safe[0], "avoid_danger"
+        # No safe neighbor: stay put rather than crash sideways.
+        return current_lane, "no_safe_neighbor"
+
+    # 3) Green token in adjacent lane and current lane has none -> grab it.
+    if not green_in_lane[current_lane]:
+        green_adj = [i for i in adjacent if green_in_lane[i] and not danger_in_lane[i]]
+        if green_adj:
+            return green_adj[0], "chase_green"
+
+    # 4) Otherwise hold.
+    return current_lane, "hold"
+
+
+def compute_controls(target_lane, lane_centers, frame_w, rear_close):
+    """Convert a target lane into (steering, acceleration)."""
+    if target_lane < 0 or not lane_centers:
+        return 0.0, 0.7  # cruise straight, modest throttle
+
+    target_x = lane_centers[target_lane]
+    car_x = frame_w / 2.0
+    # Normalise pixel offset to [-1, 1] using half-width.
+    steering = (target_x - car_x) / (frame_w / 2.0)
+    steering = max(-1.0, min(1.0, steering))
+
+    # Ease throttle while turning hard, push harder when escaping a rear car.
+    base = 1.0 if rear_close else 0.85
+    accel = base * (1.0 - 0.4 * abs(steering))
+    accel = max(0.3, min(1.0, accel))
+    return float(steering), float(accel)
+
+
+def driving_logic_task():
+    """Member 3 — read perception state, decide controls, publish to shared_data."""
+    with data_lock:
+        front_frame = shared_data['latest_front_frame']
+        tokens = list(shared_data['detected_tokens'])
+        lane_centers = list(shared_data['lane_centers'])
+        current_lane = shared_data['current_lane']
+        rear_close = shared_data['rear_vehicle_close']
+
+    if front_frame is None:
+        return
+
+    frame_h, frame_w, _ = front_frame.shape
+    target_lane, reason = decide_target_lane(
+        tokens, lane_centers, current_lane, rear_close, frame_h
+    )
+    steering, accel = compute_controls(target_lane, lane_centers, frame_w, rear_close)
+
+    with data_lock:
+        shared_data['target_lane'] = target_lane
+        shared_data['decision_reason'] = reason
+        shared_data['steering_input'] = steering
+        shared_data['acceleration_input'] = accel
+
+
 def send_controls_task():
-    #This is where you send the control commands to the car using the control_conn
+    # Read latest decision from Member 3 and push it to the simulator.
     global control_conn
     if control_conn is None:
         return
-    
-    #these are the variables used to control the car
-    #steering_input: -1.0 to 1.0 (left to right)
-    #acceleration_input: -1.0 to 1.0 (reverse to forward)
-    #this example always accelerate forward
-    steering_input = 0.0
-    acceleration_input = 1.0
+
+    with data_lock:
+        steering_input = shared_data['steering_input']
+        acceleration_input = shared_data['acceleration_input']
 
     try:
-        # Pack and send the control command
         data = struct.pack('ff', steering_input, acceleration_input)
         control_conn.sendall(data)
     except Exception as e:
@@ -396,12 +610,14 @@ if __name__ == '__main__':
     t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_front_camera_task)
     t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
     t_processing = RTTask("Processing", period=0.02, priority=TaskPriority.MEDIUM, execute_func=processing_task)
+    t_driving = RTTask("DrivingLogic", period=0.02, priority=TaskPriority.MEDIUM, execute_func=driving_logic_task)
     t_controls = RTTask("SendControls", period=0.005, priority=TaskPriority.HIGH, execute_func=send_controls_task)
-    
+
     # Start tasks to run concurrently
     t_front_camera.start()
     t_back_camera.start()
     t_processing.start()
+    t_driving.start()
     t_controls.start()
     
     try:
@@ -416,6 +632,7 @@ if __name__ == '__main__':
     t_front_camera.join()
     t_back_camera.join()
     t_processing.join()
+    t_driving.join()
     t_controls.join()
     
     # This is to close all the connections
