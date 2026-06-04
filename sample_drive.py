@@ -7,6 +7,7 @@ import time
 import keyboard
 import select
 import ctypes
+import csv
 
 # ---------------------------------------------------------
 # Configuration
@@ -16,6 +17,7 @@ FRONT_CAMERA_PORT = 8080
 BACK_CAMERA_PORT = 8082
 CONTROL_HOST = '127.0.0.1'
 CONTROL_PORT = 8081
+SHOW_CAMERA = False
 
 # Shared Resources with Mutex Lock for Concurrency
 shared_data = {
@@ -49,6 +51,9 @@ class RTTask(threading.Thread):
         self.priority = priority
         self.execute_func = execute_func
         self.daemon = True
+        self.wcet = 0
+        self.deadline_miss = 0
+        self.run_count = 0
 
     def run(self):
         print(f"[{self.name}] Started | Period: {self.period}s | Priority: {self.priority}")
@@ -63,14 +68,43 @@ class RTTask(threading.Thread):
         except Exception as e:
             pass
 
+        next_release = time.pref_counter()
         while is_running:
-            start_time = time.time()
+            self.run_count += 1
+            start_time = time.perf_counter()
             self.execute_func()
-            exec_time = time.time() - start_time
+            exec_time = time.perf_counter() - start_time
+            next_release += self.period
+            sleep_time = next_release - time.perf_counter()
+
+            if exec_time > self.wcet:
+                self.wcet = exec_time
+
+            if exec_time > self.period:
+
+                self.deadline_miss += 1
+
+                print(
+                    f"[MISS] {self.name} "
+                    f"{exec_time*1000:.2f}ms > "
+                    f"{self.period*1000:.2f}ms"
+                )
+
+            if self.run_count % 200 == 0:
+
+                print(
+                    f"[{self.name}] "
+                    f"Runs={self.run_count} "
+                    f"WCET={self.wcet*1000:.2f}ms "
+                    f"Miss={self.deadline_miss}"
+                )
+
             sleep_time = self.period - exec_time
-            
+
             if sleep_time > 0:
                 time.sleep(sleep_time)
+            
+
 
 # ---------------------------------------------------------
 # Network Connection Setup (Do not change this in your code)
@@ -184,10 +218,12 @@ def read_single_camera(sock, window_name, data_key):
                 with data_lock:
                     shared_data[data_key] = frame
                 
-                # You may disable this if you don't need to display the frames / This could effect the fps
-                frame_resized = cv2.resize(frame, (640, 480))
-                cv2.imshow(window_name, frame_resized)
-                cv2.waitKey(1)
+                if SHOW_CAMERA:
+                    # You may disable this if you don't need to display the frames / This could effect the fps
+                    # DEFAULT DISABLED -- VENNISE
+                    frame_resized = cv2.resize(frame, (640, 480))
+                    cv2.imshow(window_name, frame_resized)
+                    cv2.waitKey(1)
                 
     except Exception as e:
         pass
@@ -250,7 +286,7 @@ if __name__ == '__main__':
     # Concurrency refers to the number of instances of the task that can run at the same time
     t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_front_camera_task)
     t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
-    t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
+    t_processing = RTTask("Processing", period=0.02, priority=TaskPriority.MEDIUM, execute_func=processing_task)
     t_controls = RTTask("SendControls", period=0.005, priority=TaskPriority.HIGH, execute_func=send_controls_task)
     
     # Start tasks to run concurrently
