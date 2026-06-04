@@ -24,7 +24,11 @@ shared_data = {
     'latest_front_frame': None,
     'latest_back_frame': None,
     'steering_input' : 0.0,
-    'acceleration_input' : 0.0
+    'acceleration_input' : 1.0,
+
+    # Computer Vision 
+    'detected_tokens': [],
+
 }
 data_lock = threading.Lock()
 is_running = True
@@ -234,17 +238,122 @@ def read_front_camera_task():
 def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
 
+def detect_tokens(frame):
+    detected_tokens = []
+
+    height, width, _ = frame.shape
+
+    # ROI: Only detect the middle and front area of the road
+    roi_x1 = int(width * 0.15)
+    roi_x2 = int(width * 0.85)
+    roi_y1 = int(height * 0.05)
+    roi_y2 = int(height * 0.70)
+
+    roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    color_ranges = {
+        'green': [
+            (np.array([40, 80, 80]), np.array([85, 255, 255]))
+        ],
+        'yellow': [
+            (np.array([20, 80, 80]), np.array([35, 255, 255]))
+        ],
+        'red': [
+            (np.array([0, 80, 80]), np.array([10, 255, 255])),
+            (np.array([170, 80, 80]), np.array([180, 255, 255]))
+        ]
+    }
+
+    for color, ranges in color_ranges.items():
+        mask = None
+
+        for lower, upper in ranges:
+            current_mask = cv2.inRange(hsv, lower, upper)
+            mask = current_mask if mask is None else cv2.bitwise_or(mask, current_mask)
+
+        kernel = np.ones((5, 5), np.uint8)
+        # Remove small noise from the mask
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        # Fill small gaps inside detected objects
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+
+            if area < 300 or area > 8000:
+                continue
+
+            x, y, w, h = cv2.boundingRect(contour)
+
+            # Ignore objects that are too small or too large
+            aspect_ratio = w / float(h)
+            if aspect_ratio < 0.6 or aspect_ratio > 1.6:
+                continue
+
+            # Convert ROI coordinates back to the original frame coordinates
+            x = x + roi_x1
+            y = y + roi_y1
+
+            cx = x + w // 2
+            cy = y + h // 2
+
+            detected_tokens.append({
+                'color': color,
+                'x': cx,
+                'y': cy,
+                'area': area,
+                'box': (x, y, w, h)
+            })
+
+    return detected_tokens
+
 def processing_task():
-    #This is where you write your image processing code to decide how to control the car
-    #You can use libraries like OpenCV to process the image
-    #There is no limtation to the complexity of the processing task, you can use any libraries you want
-    #Remember to use the shared_data to get the latest frame
+    # Member 1: Get latest front camera frame
     with data_lock:
         front_frame = shared_data['latest_front_frame']
-    
-    if front_frame is not None:
-        # write your processing here
-        pass
+
+    if front_frame is None:
+        return
+
+    # Detect green, red, yellow tokens
+    detected_tokens = detect_tokens(front_frame)
+
+    # Save detection result for Member 3
+    with data_lock:
+        shared_data['detected_tokens'] = detected_tokens
+
+    # Draw bounding boxes for demo/debugging
+    debug_frame = front_frame.copy()
+
+    for token in detected_tokens:
+        x, y, w, h = token['box']
+        color_name = token['color']
+
+        if color_name == 'green':
+            box_color = (0, 255, 0)
+        elif color_name == 'red':
+            box_color = (0, 0, 255)
+        else:
+            box_color = (0, 255, 255)
+
+        cv2.rectangle(debug_frame, (x, y), (x + w, y + h), box_color, 2)
+        cv2.putText(
+            debug_frame,
+            color_name,
+            (x, y - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            box_color,
+            2
+        )
+
+    debug_frame = cv2.resize(debug_frame, (640, 480))
+    cv2.imshow("Token Detection - Member 1", debug_frame)
+    cv2.waitKey(1)
 
 def send_controls_task():
     #This is where you send the control commands to the car using the control_conn
