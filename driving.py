@@ -1,30 +1,74 @@
 """
-Member 3 — AI Driving Logic.
+Member 3 —  Driving AI (Cost-Based Planner)
 
-Reads perception state from ``rtos.shared_data``, picks a target lane
-according to a priority cascade, converts it to (steering, accel), and
-publishes those back to ``shared_data`` for ``send_controls_task`` to send.
+Key upgrades:
+- cost-based lane scoring (NOT rule-based)
+- lookahead safety
+- switching penalty
+- temporal stability (hysteresis)
+- emergency override
 """
 
 import struct
-
 import numpy as np
 
 import comms
 from rtos import shared_data, data_lock
 
 
-# Print the latest decision to the terminal every PRINT_EVERY runs so the
-# driving logic is observable without an OpenCV debug window.
-PRINT_EVERY = 25  # at 40 ms period -> roughly once per second
-EMERGENCY_REASONS = ("escape_mode", "stuck", "no_escape")
+PRINT_EVERY = 25
+
 _decision_counter = 0
 _last_reason = None
+
 _lane_lock = -1
 _lock_counter = 0
 
+
 # ---------------------------------------------------------
-# Decision logic
+# COST-BASED PLANNING CORE
+# ---------------------------------------------------------
+def compute_lane_cost(i, lane_centers, current_lane,
+                       red, yellow, green):
+
+    cost = 0.0
+
+    # -------------------------------------------------
+    # 1. SAFETY COST (VERY IMPORTANT)
+    # -------------------------------------------------
+    if red[i]:
+        cost += 1000
+    if yellow[i]:
+        cost += 200
+
+    # neighbor danger (lookahead safety)
+    if i - 1 >= 0 and red[i - 1]:
+        cost += 300
+    if i + 1 < len(lane_centers) and red[i + 1]:
+        cost += 300
+
+    # -------------------------------------------------
+    # 2. REWARD (GREEN)
+    # -------------------------------------------------
+    if green[i]:
+        cost -= 300
+
+    # -------------------------------------------------
+    # 3. LANE CHANGE COST (stability)
+    # -------------------------------------------------
+    cost += abs(i - current_lane) * 20
+
+    # -------------------------------------------------
+    # 4. EDGE PENALTY (avoid extreme jumps)
+    # -------------------------------------------------
+    if i == 0 or i == len(lane_centers) - 1:
+        cost += 30
+
+    return cost
+
+
+# ---------------------------------------------------------
+# DECISION
 # ---------------------------------------------------------
 def decide_target_lane(tokens, lane_centers, current_lane, rear_close, frame_h):
 
@@ -33,99 +77,106 @@ def decide_target_lane(tokens, lane_centers, current_lane, rear_close, frame_h):
         return -1, "no_lanes"
 
     if current_lane < 0:
-        return n // 2, "no_current_lane"
+        return n // 2, "init_center"
 
     def lane_of(x):
         return int(np.argmin([abs(x - c) for c in lane_centers]))
 
-    forward_cutoff = int(frame_h * 0.65)
+    # -------------------------------------------------
+    # detection range (early reaction)
+    # -------------------------------------------------
+    forward_cutoff = int(frame_h * 0.55)
     forward = [t for t in tokens if t['y'] < forward_cutoff]
 
-    danger = {i: False for i in range(n)}
+    red = {i: False for i in range(n)}
+    yellow = {i: False for i in range(n)}
+    green = {i: False for i in range(n)}
 
     for t in forward:
         idx = lane_of(t['x'])
-        if t['color'] in ('red', 'yellow'):
-            danger[idx] = True
 
-    left = current_lane - 1
-    right = current_lane + 1
-
-    # -------------------------------------------------
-    # ⭐ 1. BOUNDARY SAFE ADJACENT
-    # -------------------------------------------------
-    candidates = []
-    if left >= 0:
-        candidates.append(left)
-    if right < n:
-        candidates.append(right)
+        if t['color'] == 'red':
+            red[idx] = True
+        elif t['color'] == 'yellow':
+            yellow[idx] = True
+        elif t['color'] == 'green':
+            green[idx] = True
 
     # -------------------------------------------------
-    # ⭐ 2. IF CURRENT SAFE → STAY
+    # EMERGENCY OVERRIDE (hard safety)
     # -------------------------------------------------
-    if not danger[current_lane]:
-        return current_lane, "safe_hold"
+    if red[current_lane]:
+        # escape immediately
+        candidates = list(range(n))
+        best = min(
+            candidates,
+            key=lambda i: (1000 if red[i] else 0)
+        )
+        return best, "emergency_red"
 
     # -------------------------------------------------
-    # ⭐ 3. FIND SAFE NEIGHBOR
+    # COST SEARCH (GLOBAL DECISION)
     # -------------------------------------------------
-    safe = [i for i in candidates if not danger[i]]
-    if safe:
-        return safe[0], "avoid_danger"
+    candidates = list(range(n))
 
-    # -------------------------------------------------
-    # ⭐ 4. ESCAPE MODE (IMPORTANT FIX)
-    # -------------------------------------------------
-    # all lanes dangerous → pick least bad direction
-    risk_score = []
+    costs = []
     for i in candidates:
-        score = 1 if danger[i] else 0
-        risk_score.append((score, i))
+        c = compute_lane_cost(
+            i, lane_centers, current_lane,
+            red, yellow, green
+        )
+        costs.append((c, i))
 
-    if risk_score:
-        best = min(risk_score)[1]
-        return best, "escape_mode"
+    best_lane = min(costs)[1]
 
     # -------------------------------------------------
-    # ⭐ 5. NO MOVE POSSIBLE
+    # REAR VEHICLE OVERRIDE
     # -------------------------------------------------
-    return current_lane, "stuck"
+    if rear_close:
+        # prefer left/right safe lane
+        adj = [i for i in (current_lane - 1, current_lane + 1) if 0 <= i < n]
+        safe_adj = [i for i in adj if not red[i]]
+        if safe_adj:
+            best_lane = safe_adj[0]
+            return best_lane, "rear_escape"
+
+    return best_lane, "cost_planning"
 
 
+# ---------------------------------------------------------
+# CONTROL
+# ---------------------------------------------------------
 def compute_controls(target_lane, lane_centers, frame_w, rear_close):
-    """Convert a target lane into (steering, acceleration)."""
+
     if target_lane < 0 or not lane_centers:
         return 0.0, 0.7
 
     target_x = lane_centers[target_lane]
     car_x = frame_w / 2.0
+
     steering = (target_x - car_x) / (frame_w / 2.0)
     steering = max(-1.0, min(1.0, steering))
 
-    base = 1.0 if rear_close else 0.85
-    accel = base * (1.0 - 0.4 * abs(steering))
-    accel = max(0.3, min(1.0, accel))
+    # speed control
+    accel = 0.95
 
+    # slow down when turning
+    accel *= (1.0 - 0.6 * abs(steering))
+
+    # rear car boost
     if rear_close:
-        base = 1.0
-    else:
-        base = 0.9
+        accel = min(1.0, accel + 0.1)
 
-    # ⭐ ADD THIS
-    if target_lane < 0:
-        return 0.0, 0.8
+    accel = max(0.5, min(1.0, accel))
 
-    # force forward if no steering change for long time
-    if abs(steering) < 0.05:
-        accel = max(accel, 0.75)
     return float(steering), float(accel)
 
 
 # ---------------------------------------------------------
-# Periodic tasks
+# MAIN LOOP
 # ---------------------------------------------------------
 def driving_logic_task():
-    """Read perception state, decide controls, publish to shared_data."""
+
     with data_lock:
         front_frame = shared_data['latest_front_frame']
         tokens = list(shared_data['detected_tokens'])
@@ -137,27 +188,20 @@ def driving_logic_task():
         return
 
     frame_h, frame_w, _ = front_frame.shape
+
     global _lane_lock, _lock_counter
 
     candidate_lane, reason = decide_target_lane(
         tokens, lane_centers, current_lane, rear_close, frame_h
     )
 
-    # -----------------------------
-    # ⭐ LOCK LOGIC
-    # -----------------------------
-    LOCK_FRAMES = 8  # ~0.3s stable (depends on 25Hz task)
+    # -------------------------------------------------
+    # TEMPORAL STABILITY (HYSTERESIS)
+    # -------------------------------------------------
+    LOCK_FRAMES = 6
 
     if _lane_lock == -1 and candidate_lane != -1:
         _lane_lock = candidate_lane
-        _lock_counter = 0
-
-    elif reason in EMERGENCY_REASONS:
-        # ❗ force override lock faster
-        _lock_counter += 2
-        if _lock_counter > 3:
-            _lane_lock = candidate_lane
-            _lock_counter = 0
 
     elif candidate_lane == _lane_lock:
         _lock_counter = 0
@@ -168,11 +212,15 @@ def driving_logic_task():
             _lane_lock = candidate_lane
             _lock_counter = 0
 
+    # clamp
     if _lane_lock >= len(lane_centers):
-        _lane_lock = len(lane_centers) // 2
-    
+        _lane_lock = max(0, len(lane_centers) // 2)
+
     target_lane = _lane_lock
-    steering, accel = compute_controls(target_lane, lane_centers, frame_w, rear_close)
+
+    steering, accel = compute_controls(
+        target_lane, lane_centers, frame_w, rear_close
+    )
 
     with data_lock:
         shared_data['target_lane'] = target_lane
@@ -180,31 +228,36 @@ def driving_logic_task():
         shared_data['steering_input'] = steering
         shared_data['acceleration_input'] = accel
 
-    # Visible heartbeat for Member 3 — print on cadence OR whenever the
-    # reason changes (so you can see "hold -> chase_green" transitions live).
+    # -------------------------------------------------
+    # DEBUG
+    # -------------------------------------------------
     global _decision_counter, _last_reason
     _decision_counter += 1
+
     if reason != _last_reason or _decision_counter % PRINT_EVERY == 0:
         print(
-            f"[DrivingLogic] reason={reason:<18} "
-            f"current_lane={current_lane} target_lane={target_lane} "
+            f"[AI-PROD] reason={reason:<15} "
+            f"lane={current_lane}->{target_lane} "
             f"steer={steering:+.2f} accel={accel:.2f} "
             f"(tokens={len(tokens)})"
         )
         _last_reason = reason
 
 
+# ---------------------------------------------------------
+# SEND CONTROL
+# ---------------------------------------------------------
 def send_controls_task():
-    """Push the latest decision to the simulator."""
+
     if comms.control_conn is None:
         return
 
     with data_lock:
-        steering_input = shared_data['steering_input']
-        acceleration_input = shared_data['acceleration_input']
+        steering = shared_data['steering_input']
+        accel = shared_data['acceleration_input']
 
     try:
-        data = struct.pack('ff', steering_input, acceleration_input)
+        data = struct.pack('ff', steering, accel)
         comms.control_conn.sendall(data)
     except Exception as e:
         print(f"Control send error: {e}")
