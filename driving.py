@@ -1,3 +1,14 @@
+"""
+Member 3 —  Driving AI (Cost-Based Planner)
+
+Key upgrades:
+- cost-based lane scoring (NOT rule-based)
+- lookahead safety
+- switching penalty
+- temporal stability (hysteresis)
+- emergency override
+"""
+
 import struct
 import numpy as np
 
@@ -5,121 +16,160 @@ import comms
 from rtos import shared_data, data_lock
 
 
-# =========================================================
-# CONFIG
-# =========================================================
 PRINT_EVERY = 25
-TTC_HORIZON = 12.0          # how far ahead we care
-DANGER_THRESHOLD = 0.65     # risk trigger
-ESCAPE_MARGIN = 0.10        # bias to move away from danger
+
+_decision_counter = 0
+_last_reason = None
+
+_lane_lock = -1
+_lock_counter = 0
 
 
-# =========================================================
-# TTC ESTIMATION (CORE PREDICTION MODEL)
-# =========================================================
-def estimate_ttc(y, frame_h):
-    """
-    Simple but effective proxy:
-    - higher y = closer to car
-    - assume constant approach speed
-    """
+# ---------------------------------------------------------
+# COST-BASED PLANNING CORE
+# ---------------------------------------------------------
+def corridor_width(lane_idx, red, yellow, n):
 
-    norm_dist = 1.0 - (y / frame_h)
-    norm_dist = max(0.01, norm_dist)
+    width = 1
 
-    assumed_speed = 0.06  # tuned constant (higher = faster approach)
+    i = lane_idx - 1
 
-    return norm_dist / assumed_speed
+    while i >= 0:
 
+        if red[i] or yellow[i]:
+            break
 
-# =========================================================
-# LANE MAPPING
-# =========================================================
-def lane_of(x, lane_centers):
-    return int(np.argmin([abs(x - c) for c in lane_centers]))
+        width += 1
+        i -= 1
 
+    i = lane_idx + 1
 
-# =========================================================
-# TTC RISK FIELD (PREDICTIVE OCCUPANCY)
-# =========================================================
-def compute_risk_field(tokens, lane_centers, frame_h):
-    n = len(lane_centers)
-    risk = np.zeros(n, dtype=np.float32)
+    while i < n:
 
-    for t in tokens:
-        if t['color'] != 'red':
+        if red[i] or yellow[i]:
+            break
+
+        width += 1
+        i += 1
+
+    return width
+
+def compute_lane_cost(
+        i,
+        lane_centers,
+        current_lane,
+        red,
+        yellow,
+        green,
+        n):
+
+    cost = 0.0
+
+    # ==================================================
+    # 1. HARD SAFETY
+    # ==================================================
+
+    if red[i]:
+        cost += 5000
+
+    if yellow[i]:
+        cost += 1200
+
+    # ==================================================
+    # 2. NEIGHBOUR DANGER
+    # ==================================================
+
+    if i > 0:
+
+        if red[i - 1]:
+            cost += 800
+
+        elif yellow[i - 1]:
+            cost += 300
+
+    if i < n - 1:
+
+        if red[i + 1]:
+            cost += 800
+
+        elif yellow[i + 1]:
+            cost += 300
+
+    # ==================================================
+    # 3. GREEN REWARD
+    # ==================================================
+
+    if green[i]:
+
+        reward = 120
+
+        reward -= abs(i - current_lane) * 20
+
+        cost -= max(reward, 0)
+
+    # ==================================================
+    # 4. SAFE CORRIDOR BONUS
+    # ==================================================
+
+    width = corridor_width(i, red, n)
+
+    cost -= width * 40
+
+    # ==================================================
+    # 5. LANE CHANGE COST
+    # ==================================================
+
+    cost += abs(i - current_lane) * 35
+
+    # ==================================================
+    # 6. EDGE PENALTY
+    # ==================================================
+
+    if i == 0 or i == n - 1:
+        cost += 20
+
+    return cost
+
+def best_escape_lane(
+        current_lane,
+        red,
+        yellow,
+        n):
+
+    best_lane = current_lane
+    best_score = -99999
+
+    for i in range(n):
+
+        if red[i]:
             continue
 
-        lane = lane_of(t['x'], lane_centers)
-        ttc = estimate_ttc(t['y'], frame_h)
-
-        if ttc > TTC_HORIZON:
+        if yellow[i]:
             continue
 
-        # convert TTC → risk (closer = higher risk)
-        r = (TTC_HORIZON - ttc) / TTC_HORIZON
+        width = corridor_width(
+            i,
+            red,
+            yellow,
+            n
+        )
 
-        risk[lane] += r
+        score = (
+            width * 100
+            - abs(i - current_lane) * 10
+        )
 
-        # spread risk to neighbors (important for realism)
-        if lane - 1 >= 0:
-            risk[lane - 1] += r * 0.6
-        if lane + 1 < n:
-            risk[lane + 1] += r * 0.6
+        if score > best_score:
 
-    return risk
+            best_score = score
+            best_lane = i
 
+    return best_lane
 
-# =========================================================
-# GREEN ATTRACTION FIELD
-# =========================================================
-def green_field(tokens, lane_centers, frame_h):
-    n = len(lane_centers)
-    reward = np.zeros(n, dtype=np.float32)
-
-    for t in tokens:
-        if t['color'] != 'green':
-            continue
-
-        lane = lane_of(t['x'], lane_centers)
-        ttc = estimate_ttc(t['y'], frame_h)
-
-        if ttc > TTC_HORIZON:
-            continue
-
-        r = (TTC_HORIZON - ttc) / TTC_HORIZON
-        reward[lane] += r
-
-    return reward
-
-
-# =========================================================
-# SAFETY ESCAPE (HARD KERNEL)
-# =========================================================
-def emergency_escape(current_lane, risk, n):
-    """
-    Always guarantee escape if possible.
-    """
-
-    # 1-hop escape
-    candidates = [i for i in range(n) if risk[i] < DANGER_THRESHOLD]
-
-    if candidates:
-        return min(candidates, key=lambda x: abs(x - current_lane)), "TTC_ESCAPE"
-
-    # 2-hop escape
-    for d in [-2, 2]:
-        i = current_lane + d
-        if 0 <= i < n:
-            return i, "TTC_2HOP_ESCAPE"
-
-    return current_lane, "TTC_TRAPPED"
-
-
-# =========================================================
-# MAIN DECISION ENGINE
-# =========================================================
-def decide_target_lane(tokens, lane_centers, current_lane, frame_h):
+# ---------------------------------------------------------
+# DECISION
+# ---------------------------------------------------------
+def decide_target_lane(tokens, lane_centers, current_lane, rear_close, frame_h):
 
     n = len(lane_centers)
     if n == 0:
@@ -131,94 +181,105 @@ def decide_target_lane(tokens, lane_centers, current_lane, frame_h):
     def lane_of(x):
         return int(np.argmin([abs(x - c) for c in lane_centers]))
 
-    # -------------------------------
-    # BUILD LANE STATE
-    # -------------------------------
+    # -------------------------------------------------
+    # detection range (early reaction)
+    # -------------------------------------------------
+    forward_cutoff = int(frame_h * 0.85)
+    forward = [t for t in tokens if t['y'] < forward_cutoff]
+
     red = {i: False for i in range(n)}
     yellow = {i: False for i in range(n)}
     green = {i: False for i in range(n)}
 
-    forward_cutoff = int(frame_h * 0.6)
-    forward = [t for t in tokens if t['y'] < forward_cutoff]
-
     for t in forward:
-        i = lane_of(t['x'])
+        idx = lane_of(t['x'])
 
         if t['color'] == 'red':
-            red[i] = True
+            red[idx] = True
         elif t['color'] == 'yellow':
-            yellow[i] = True
+            yellow[idx] = True
         elif t['color'] == 'green':
-            green[i] = True
+            green[idx] = True
 
-    # =====================================================
-    # 🥇 RULE 1: GREEN ALWAYS WIN
-    # =====================================================
-    green_lanes = [i for i in range(n) if green[i] and not red[i]]
+    # -------------------------------------------------
+    # EMERGENCY OVERRIDE (hard safety)
+    # -------------------------------------------------
+    if red[current_lane]:
+        # escape immediately
+        candidates = list(range(n))
+        best =best_escape_lane(
+            current_lane,
+            red,
+            n
+        )
+        return best, "emergency_red"
 
-    if green_lanes:
-        best = min(green_lanes, key=lambda x: abs(x - current_lane))
-        return best, "GREEN_OVERRIDE"
+    # -------------------------------------------------
+    # COST SEARCH (GLOBAL DECISION)
+    # -------------------------------------------------
+    candidates = list(range(n))
 
-    # =====================================================
-    # 🥈 RULE 2: YELLOW + RED → VOID ONLY (SAFE LANES)
-    # =====================================================
-    safe_void = [
-        i for i in range(n)
-        if not red[i] and not yellow[i]
-    ]
+    costs = []
+    for i in candidates:
+        c = compute_lane_cost(
+                i,
+                lane_centers,
+                current_lane,
+                red,
+                yellow,
+                green,
+                n
+            )
+        costs.append((c, i))
 
-    if safe_void:
-        best = min(safe_void, key=lambda x: abs(x - current_lane))
-        return best, "SAFE_VOID"
+    best_lane = min(costs)[1]
 
-    # =====================================================
-    # 🥉 RULE 3: ONLY RED → ESCAPE
-    # =====================================================
-    if any(red.values()):
-        safe = [i for i in range(n) if not red[i]]
+    # -------------------------------------------------
+    # REAR VEHICLE OVERRIDE
+    # -------------------------------------------------
+    if rear_close:
+        # prefer left/right safe lane
+        adj = [i for i in (current_lane - 1, current_lane + 1) if 0 <= i < n]
+        safe_adj = [i for i in adj if not red[i]]
+        if safe_adj:
+            best_lane = safe_adj[0]
+            return best_lane, "rear_escape"
 
-        if safe:
-            best = min(safe, key=lambda x: abs(x - current_lane))
-            return best, "ESCAPE_RED"
-
-        # 2-hop escape
-        for d in [-2, 2]:
-            i = current_lane + d
-            if 0 <= i < n:
-                return i, "ESCAPE_2HOP"
-
-    # =====================================================
-    # FALLBACK
-    # =====================================================
-    return current_lane, "HOLD"
+    return best_lane, "cost_planning"
 
 
-# =========================================================
-# CONTROL MAPPING
-# =========================================================
+# ---------------------------------------------------------
+# CONTROL
+# ---------------------------------------------------------
 def compute_controls(target_lane, lane_centers, frame_w, rear_close):
 
     if target_lane < 0 or not lane_centers:
-        return 0.0, 0.6
+        return 0.0, 0.7
 
     target_x = lane_centers[target_lane]
     car_x = frame_w / 2.0
 
     steering = (target_x - car_x) / (frame_w / 2.0)
-    steering = float(np.clip(steering, -1.0, 1.0))
+    steering = max(-1.0, min(1.0, steering))
 
-    accel = 0.88 * (1.0 - 0.55 * abs(steering))
+    # speed control
+    accel = 0.95
 
+    # slow down when turning
+    accel *= (1.0 - 0.6 * abs(steering))
+
+    # rear car boost
     if rear_close:
-        accel += 0.12
+        accel = min(1.0, accel + 0.1)
 
-    return steering, float(np.clip(accel, 0.4, 1.0))
+    accel = max(0.5, min(1.0, accel))
+
+    return float(steering), float(accel)
 
 
-# =========================================================
-# RTOS TASK
-# =========================================================
+# ---------------------------------------------------------
+# MAIN LOOP
+# ---------------------------------------------------------
 def driving_logic_task():
 
     with data_lock:
@@ -233,9 +294,44 @@ def driving_logic_task():
 
     frame_h, frame_w, _ = front_frame.shape
 
-    target_lane, reason = decide_target_lane(
-        tokens, lane_centers, current_lane, frame_h
+    global _lane_lock, _lock_counter
+
+    candidate_lane, reason = decide_target_lane(
+        tokens, lane_centers, current_lane, rear_close, frame_h
     )
+
+    # -------------------------------------------------
+    # TEMPORAL STABILITY (HYSTERESIS)
+    # -------------------------------------------------
+    LOCK_FRAMES = 2
+
+    if reason == "emergency_red":
+
+        _lane_lock = candidate_lane
+        _lock_counter = 0
+
+    elif _lane_lock == -1 and candidate_lane != -1:
+
+        _lane_lock = candidate_lane
+
+    elif candidate_lane == _lane_lock:
+
+        _lock_counter = 0
+
+    else:
+
+        _lock_counter += 1
+
+        if _lock_counter > LOCK_FRAMES:
+
+            _lane_lock = candidate_lane
+            _lock_counter = 0
+
+    # clamp
+    if _lane_lock >= len(lane_centers):
+        _lane_lock = max(0, len(lane_centers) // 2)
+
+    target_lane = _lane_lock
 
     steering, accel = compute_controls(
         target_lane, lane_centers, frame_w, rear_close
@@ -247,10 +343,25 @@ def driving_logic_task():
         shared_data['steering_input'] = steering
         shared_data['acceleration_input'] = accel
 
+    # -------------------------------------------------
+    # DEBUG
+    # -------------------------------------------------
+    global _decision_counter, _last_reason
+    _decision_counter += 1
 
-# =========================================================
-# SEND TASK
-# =========================================================
+    if reason != _last_reason or _decision_counter % PRINT_EVERY == 0:
+        print(
+            f"[AI-PROD] reason={reason:<15} "
+            f"lane={current_lane}->{target_lane} "
+            f"steer={steering:+.2f} accel={accel:.2f} "
+            f"(tokens={len(tokens)})"
+        )
+        _last_reason = reason
+
+
+# ---------------------------------------------------------
+# SEND CONTROL
+# ---------------------------------------------------------
 def send_controls_task():
 
     if comms.control_conn is None:
@@ -261,7 +372,8 @@ def send_controls_task():
         accel = shared_data['acceleration_input']
 
     try:
-        comms.control_conn.sendall(struct.pack('ff', steering, accel))
+        data = struct.pack('ff', steering, accel)
+        comms.control_conn.sendall(data)
     except Exception as e:
         print(f"Control send error: {e}")
         comms.control_conn = None
