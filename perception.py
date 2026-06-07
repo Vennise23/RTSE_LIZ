@@ -155,60 +155,125 @@ def detect_tokens(frame):
 # ---------------------------------------------------------
 def detect_lanes(frame):
     """
-    Returns (lane_centers, current_lane).
+    Fixed 5-lane lane detection for SpeedTrials2D.
 
-    Strategy (top-down 2D racing view):
-      1. Take a horizontal strip near the bottom (where the car is).
-      2. Threshold for bright lane markings in HSV (low sat, high val).
-      3. Sum the mask along Y to get a 1D column profile.
-      4. Peaks above threshold (with clustering) = lane separator stripes.
-      5. Lane centers = midpoints between adjacent separators.
-      6. Current lane = lane center closest to image bottom-center X.
+    Key idea:
+      - DO NOT infer number of lanes
+      - Always assume 5 lanes => 6 separators
+      - Use white dashed lines ONLY (ignore red edges)
+      - Stabilize using clustering + memory
+
+    Returns:
+        lane_centers (list of 5 ints),
+        current_lane (int)
     """
+
+    import numpy as np
+    import cv2
+    from rtos import shared_data, data_lock
+
     height, width, _ = frame.shape
 
-    roi_y1 = int(height * 0.55)
-    roi_y2 = int(height * 0.90)
-    roi = frame[roi_y1:roi_y2, :]
+    # -------------------------------------------------
+    # 1. ROI (road area only)
+    # -------------------------------------------------
+    roi = frame[int(height * 0.55):int(height * 0.95), :]
 
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    lower = np.array([0,   0,   180])
-    upper = np.array([180, 60,  255])
-    mask = cv2.inRange(hsv, lower, upper)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
-    col_profile = mask.sum(axis=0).astype(np.float32)
-    if col_profile.max() <= 0:
+    # -------------------------------------------------
+    # 2. ONLY detect WHITE dashed lane markers
+    # (this ignores red/white border edges)
+    # -------------------------------------------------
+    lower_white = np.array([0, 0, 200])
+    upper_white = np.array([180, 60, 255])
+    mask = cv2.inRange(hsv, lower_white, upper_white)
+
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # -------------------------------------------------
+    # 3. column density
+    # -------------------------------------------------
+    col = np.sum(mask, axis=0).astype(np.float32)
+
+    if col.max() < 1:
         return [], -1
-    col_profile /= col_profile.max()
 
-    peak_threshold = 0.4
-    min_separation_px = max(20, width // 20)
-    candidate_idx = np.where(col_profile > peak_threshold)[0]
-    if len(candidate_idx) == 0:
+    col /= col.max()
+
+    # -------------------------------------------------
+    # 4. peak detection
+    # -------------------------------------------------
+    idx = np.where(col > 0.35)[0]
+    if len(idx) == 0:
         return [], -1
 
-    # Cluster consecutive bright columns into single separator peaks.
     separators = []
-    cluster_start = candidate_idx[0]
-    prev = candidate_idx[0]
-    for x in candidate_idx[1:]:
-        if x - prev > min_separation_px:
-            separators.append((cluster_start + prev) // 2)
-            cluster_start = x
-        prev = x
-    separators.append((cluster_start + prev) // 2)
+    start = idx[0]
+    prev = idx[0]
 
+    min_gap = max(25, width // 30)
+
+    for x in idx[1:]:
+        if x - prev > min_gap:
+            separators.append((start + prev) // 2)
+            start = x
+        prev = x
+
+    separators.append((start + prev) // 2)
+
+    # -------------------------------------------------
+    # 5. FORCE 6 separators (for 5 lanes)
+    # -------------------------------------------------
     if len(separators) < 2:
         return [], -1
 
-    lane_centers = [(separators[i] + separators[i + 1]) // 2
-                    for i in range(len(separators) - 1)]
-    if not lane_centers:
-        return [], -1
+    # sort & clean
+    separators = sorted(separators)
+
+    # if too many → compress
+    if len(separators) > 6:
+        step = len(separators) / 6
+        separators = [separators[int(i * step)] for i in range(6)]
+
+    # if too few → interpolate
+    while len(separators) < 6:
+        # simple interpolation
+        if len(separators) >= 2:
+            new = (separators[-1] + width // 5)
+            separators.append(new)
+        else:
+            return [], -1
+
+    separators = sorted(separators[:6])
+
+    # -------------------------------------------------
+    # 6. lane centers (5 lanes)
+    # -------------------------------------------------
+    lane_centers = [
+        (separators[i] + separators[i + 1]) // 2
+        for i in range(5)
+    ]
+
+    # -------------------------------------------------
+    # 7. current lane (MEMORY STABILIZED)
+    # -------------------------------------------------
+    with data_lock:
+        prev_lane = shared_data.get("current_lane", 2)
 
     car_x = width // 2
-    current_lane = int(np.argmin([abs(c - car_x) for c in lane_centers]))
+
+    # choose closest lane center
+    raw_lane = int(np.argmin([abs(c - car_x) for c in lane_centers]))
+
+    # smoothing (prevents flicker)
+    alpha = 0.6
+    current_lane = int(round(alpha * prev_lane + (1 - alpha) * raw_lane))
+
+    current_lane = max(0, min(current_lane, 4))
+
     return lane_centers, current_lane
 
 
