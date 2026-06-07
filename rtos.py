@@ -21,6 +21,9 @@ shared_data = {
     'latest_back_frame': None,
     'steering_input': 0.0,
     'acceleration_input': 1.0,
+    
+    'front_frame_id': 0,
+    'back_frame_id': 0,
 
     # Computer Vision
     'detected_tokens': [],

@@ -17,68 +17,79 @@ from rtos import shared_data, data_lock
 # Print the latest decision to the terminal every PRINT_EVERY runs so the
 # driving logic is observable without an OpenCV debug window.
 PRINT_EVERY = 25  # at 40 ms period -> roughly once per second
+EMERGENCY_REASONS = ("escape_mode", "stuck", "no_escape")
 _decision_counter = 0
 _last_reason = None
-
+_lane_lock = -1
+_lock_counter = 0
 
 # ---------------------------------------------------------
 # Decision logic
 # ---------------------------------------------------------
 def decide_target_lane(tokens, lane_centers, current_lane, rear_close, frame_h):
-    """
-    Pick the best lane to be in.
 
-    Priority (high -> low):
-      1. Rear vehicle close       -> sidestep to an adjacent lane
-      2. Red/Yellow in current    -> move to a safer adjacent lane
-      3. Green in adjacent lane   -> grab it
-      4. Otherwise                -> hold current lane (or center if unknown)
-
-    Returns (target_lane_index, reason_str).
-    """
-    n_lanes = len(lane_centers)
-    if n_lanes == 0:
+    n = len(lane_centers)
+    if n == 0:
         return -1, "no_lanes"
 
     if current_lane < 0:
-        return n_lanes // 2, "no_current_lane"
+        return n // 2, "no_current_lane"
 
-    def lane_of(token_x):
-        return int(np.argmin([abs(token_x - c) for c in lane_centers]))
+    def lane_of(x):
+        return int(np.argmin([abs(x - c) for c in lane_centers]))
 
-    # Only consider tokens that are in front of us (upper portion of frame).
     forward_cutoff = int(frame_h * 0.65)
-    forward_tokens = [t for t in tokens if t['y'] < forward_cutoff]
+    forward = [t for t in tokens if t['y'] < forward_cutoff]
 
-    danger_in_lane = {i: False for i in range(n_lanes)}
-    green_in_lane = {i: False for i in range(n_lanes)}
-    for t in forward_tokens:
+    danger = {i: False for i in range(n)}
+
+    for t in forward:
         idx = lane_of(t['x'])
         if t['color'] in ('red', 'yellow'):
-            danger_in_lane[idx] = True
-        elif t['color'] == 'green':
-            green_in_lane[idx] = True
+            danger[idx] = True
 
-    adjacent = [i for i in (current_lane - 1, current_lane + 1) if 0 <= i < n_lanes]
+    left = current_lane - 1
+    right = current_lane + 1
 
-    if rear_close and adjacent:
-        safe = [i for i in adjacent if not danger_in_lane[i]]
-        if safe:
-            return safe[0], "rear_close_swerve"
-        return adjacent[0], "rear_close_forced"
+    # -------------------------------------------------
+    # ⭐ 1. BOUNDARY SAFE ADJACENT
+    # -------------------------------------------------
+    candidates = []
+    if left >= 0:
+        candidates.append(left)
+    if right < n:
+        candidates.append(right)
 
-    if danger_in_lane[current_lane]:
-        safe = [i for i in adjacent if not danger_in_lane[i]]
-        if safe:
-            return safe[0], "avoid_danger"
-        return current_lane, "no_safe_neighbor"
+    # -------------------------------------------------
+    # ⭐ 2. IF CURRENT SAFE → STAY
+    # -------------------------------------------------
+    if not danger[current_lane]:
+        return current_lane, "safe_hold"
 
-    if not green_in_lane[current_lane]:
-        green_adj = [i for i in adjacent if green_in_lane[i] and not danger_in_lane[i]]
-        if green_adj:
-            return green_adj[0], "chase_green"
+    # -------------------------------------------------
+    # ⭐ 3. FIND SAFE NEIGHBOR
+    # -------------------------------------------------
+    safe = [i for i in candidates if not danger[i]]
+    if safe:
+        return safe[0], "avoid_danger"
 
-    return current_lane, "hold"
+    # -------------------------------------------------
+    # ⭐ 4. ESCAPE MODE (IMPORTANT FIX)
+    # -------------------------------------------------
+    # all lanes dangerous → pick least bad direction
+    risk_score = []
+    for i in candidates:
+        score = 1 if danger[i] else 0
+        risk_score.append((score, i))
+
+    if risk_score:
+        best = min(risk_score)[1]
+        return best, "escape_mode"
+
+    # -------------------------------------------------
+    # ⭐ 5. NO MOVE POSSIBLE
+    # -------------------------------------------------
+    return current_lane, "stuck"
 
 
 def compute_controls(target_lane, lane_centers, frame_w, rear_close):
@@ -94,6 +105,19 @@ def compute_controls(target_lane, lane_centers, frame_w, rear_close):
     base = 1.0 if rear_close else 0.85
     accel = base * (1.0 - 0.4 * abs(steering))
     accel = max(0.3, min(1.0, accel))
+
+    if rear_close:
+        base = 1.0
+    else:
+        base = 0.9
+
+    # ⭐ ADD THIS
+    if target_lane < 0:
+        return 0.0, 0.8
+
+    # force forward if no steering change for long time
+    if abs(steering) < 0.05:
+        accel = max(accel, 0.75)
     return float(steering), float(accel)
 
 
@@ -113,9 +137,41 @@ def driving_logic_task():
         return
 
     frame_h, frame_w, _ = front_frame.shape
-    target_lane, reason = decide_target_lane(
+    global _lane_lock, _lock_counter
+
+    candidate_lane, reason = decide_target_lane(
         tokens, lane_centers, current_lane, rear_close, frame_h
     )
+
+    # -----------------------------
+    # ⭐ LOCK LOGIC
+    # -----------------------------
+    LOCK_FRAMES = 8  # ~0.3s stable (depends on 25Hz task)
+
+    if _lane_lock == -1 and candidate_lane != -1:
+        _lane_lock = candidate_lane
+        _lock_counter = 0
+
+    elif reason in EMERGENCY_REASONS:
+        # ❗ force override lock faster
+        _lock_counter += 2
+        if _lock_counter > 3:
+            _lane_lock = candidate_lane
+            _lock_counter = 0
+
+    elif candidate_lane == _lane_lock:
+        _lock_counter = 0
+
+    else:
+        _lock_counter += 1
+        if _lock_counter > LOCK_FRAMES:
+            _lane_lock = candidate_lane
+            _lock_counter = 0
+
+    if _lane_lock >= len(lane_centers):
+        _lane_lock = len(lane_centers) // 2
+    
+    target_lane = _lane_lock
     steering, accel = compute_controls(target_lane, lane_centers, frame_w, rear_close)
 
     with data_lock:
