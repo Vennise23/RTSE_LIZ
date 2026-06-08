@@ -1,260 +1,255 @@
 """
-Member 3 — Driving AI (Stable Goal Planner v5)
+Member 3 — Driving AI (V10 FIXED)
+CORE GOAL: MAX DISTANCE (NOT GREEN CHASING)
 
 FIXES:
-- removes distance instability
-- prevents green flicker chasing
-- strong red avoidance
-- goal commitment system
-- temporal smoothing + lane lock
+- RRV / RRVVV deadlock escape
+- NO red entry EVER
+- green only local reward
+- void escape when trapped
+- fast reaction (no goal delay)
+- lane lock stability without lag
 """
 
 import struct
 import numpy as np
-
 import comms
 from rtos import shared_data, data_lock
 
 
-PRINT_EVERY = 25
-
-# ---------------------------------------------------------
-# STATE MEMORY (IMPORTANT FIX)
-# ---------------------------------------------------------
+# =========================
+# STATE MEMORY
+# =========================
 _lane_lock = -1
 _lock_counter = 0
 
-_goal_lane = -1
-_goal_timer = 0
+_speed_mem = 0.85
+_last_reason = ""
+_counter = 0
 
-_decision_counter = 0
-_last_reason = None
+PRINT_EVERY = 20
 
 
-# =========================================================
+# =========================
 # HELPERS
-# =========================================================
-def lane_of(x, lane_centers):
-    return int(np.argmin([abs(x - c) for c in lane_centers]))
+# =========================
+def lane_of(x, centers):
+    return int(np.argmin([abs(x - c) for c in centers]))
 
 
 def corridor_width(i, red, yellow, n):
-    width = 1
-
+    w = 1
     j = i - 1
     while j >= 0 and not red[j] and not yellow[j]:
-        width += 1
+        w += 1
         j -= 1
 
     j = i + 1
     while j < n and not red[j] and not yellow[j]:
-        width += 1
+        w += 1
         j += 1
+    return w
+
+
+def is_trapped(i, red, n):
+    """RRV / RRVVV fix detection"""
+    left_block = (i <= 0) or red[i - 1]
+    right_block = (i >= n - 1) or red[i + 1]
+    return left_block and right_block
+
+
+def nearest_safe_lane(current, red, n):
+    candidates = [i for i in range(n) if not red[i]]
+    if not candidates:
+        return current
+    return min(candidates, key=lambda i: abs(i - current))
+
+
+# =========================
+# LOCAL GREEN ONLY (NO CHASE)
+# =========================
+def local_green_score(tokens, lane_centers, frame_h, current_lane, n):
+    score = {i: 0 for i in range(n)}
+
+    for t in tokens:
+        if t['color'] != 'green':
+            continue
+
+        li = lane_of(t['x'], lane_centers)
+        dist = frame_h - t['y']
+
+        # ONLY local influence (prevents chasing far green)
+        if abs(li - current_lane) <= 1:
+            score[li] += 1.0 / max(dist, 20)
+
+    best_lane = max(score, key=score.get)
+    return best_lane if score[best_lane] > 0.02 else -1
+
+
+# =========================
+# DECISION ENGINE (FAST SAFETY FIRST)
+# =========================
+def lane_risk_score(i, red, yellow, n):
+
+    # HARD BLOCK
+    if red[i]:
+        return 1e9
+
+    risk = 0
+
+    # local danger
+    if i > 0 and red[i - 1]:
+        risk += 500
+    if i < n - 1 and red[i + 1]:
+        risk += 500
+
+    # trap pattern detection (RRV / RRVVV)
+    if i > 0 and i < n - 1:
+        if red[i - 1] and red[i + 1]:
+            risk += 1200
+
+    # yellow weak penalty
+    if yellow[i]:
+        risk += 120
+
+    return risk
+
+
+def safe_corridor_score(i, red, yellow, n):
+
+    # how long can we move forward without hitting red
+    width = 1
+
+    j = i
+    # look LEFT corridor
+    k = i - 1
+    while k >= 0 and not red[k]:
+        width += 1
+        k -= 1
+
+    # look RIGHT corridor
+    k = i + 1
+    while k < n and not red[k]:
+        width += 1
+        k += 1
 
     return width
 
-
-# =========================================================
-# STAGE 1 — FILTER (hard safety)
-# =========================================================
-def filter_safe(current_lane, red, n):
-    safe = [i for i in range(n) if not red[i]]
-    if not safe:
-        return [current_lane]
-    return safe
-
-
-# =========================================================
-# STAGE 2 — GREEN GOAL SELECTION (STABLE)
-# =========================================================
-def select_green_goal(tokens, lane_centers, red, yellow, current_lane, frame_h, n):
-
-    forward_cutoff = int(frame_h * 0.85)
-    tokens = [t for t in tokens if t['y'] < forward_cutoff]
-
-    green_score = {}
-
-    for i in range(n):
-        green_score[i] = 0
-
-    for t in tokens:
-        li = lane_of(t['x'], lane_centers)
-        dist = frame_h - t['y']
-
-        if t['color'] == 'green':
-            green_score[li] += 1000 / max(dist, 10)
-
-        elif t['color'] == 'yellow':
-            green_score[li] -= 200 / max(dist, 10)
-
-        elif t['color'] == 'red':
-            green_score[li] -= 5000 / max(dist, 10)
-
-    # pick best green lane (stable)
-    best_lane = max(green_score.items(), key=lambda x: x[1])[0]
-
-    if green_score[best_lane] > 1:
-        return best_lane
-
-    return -1
-
-
-# =========================================================
-# STAGE 3 — COST PLANNER (stable navigation)
-# =========================================================
-def score_lane(i, tokens, lane_centers, current_lane, red, yellow, green, frame_h, n):
-
-    cost = 0.0
-
-    # -------------------------
-    # red/yellow hard penalty
-    # -------------------------
-    if red[i]:
-        cost += 10000
-    if yellow[i]:
-        cost += 800
-
-    # neighbor danger
-    if i > 0:
-        if red[i - 1]:
-            cost += 1500
-        elif yellow[i - 1]:
-            cost += 400
-
-    if i < n - 1:
-        if red[i + 1]:
-            cost += 1500
-        elif yellow[i + 1]:
-            cost += 400
-
-    # corridor bonus
-    cost -= corridor_width(i, red, yellow, n) * 60
-
-    # switching cost
-    cost += abs(i - current_lane) * 50
-
-    # -------------------------
-    # green influence (weak)
-    # -------------------------
-    for t in tokens:
-        li = lane_of(t['x'], lane_centers)
-        if li != i:
-            continue
-
-        dist = frame_h - t['y']
-        w = np.exp(-dist / (frame_h * 0.4))
-
-        if t['color'] == 'green':
-            cost -= 400 * w
-
-    return cost
-
-
-# =========================================================
-# DECISION ENGINE (GOAL + FALLBACK)
-# =========================================================
-def decide_target_lane(tokens, lane_centers, current_lane, frame_h):
-
-    global _goal_lane, _goal_timer
+def decide(tokens, lane_centers, current_lane, frame_h):
 
     n = len(lane_centers)
     if n == 0:
-        return -1, "no_lanes"
-
-    if current_lane < 0:
-        return n // 2, "init_center"
+        return -1, "no_lane"
 
     red = {i: False for i in range(n)}
     yellow = {i: False for i in range(n)}
-    green = {i: False for i in range(n)}
 
-    forward_cutoff = int(frame_h * 0.85)
-    forward = [t for t in tokens if t['y'] < forward_cutoff]
+    forward_cut = int(frame_h * 0.85)
+    forward = [t for t in tokens if t['y'] < forward_cut]
 
     for t in forward:
         i = lane_of(t['x'], lane_centers)
-
-        if t['color'] == 'red':
+        if t['color'] == "red":
             red[i] = True
-        elif t['color'] == 'yellow':
+        elif t['color'] == "yellow":
             yellow[i] = True
-        elif t['color'] == 'green':
-            green[i] = True
 
-    # =====================================================
-    # EMERGENCY
-    # =====================================================
+    # =========================
+    # EMERGENCY (NO DISCUSSION)
+    # =========================
     if red[current_lane]:
-        safe = filter_safe(current_lane, red, n)
-        best = min(safe, key=lambda i: abs(i - current_lane))
-        _goal_timer = 0
-        _goal_lane = -1
-        return best, "emergency"
+        return nearest_safe_lane(current_lane, red, n), "EMERGENCY_RED"
 
-    # =====================================================
-    # GOAL LOCK SYSTEM (IMPORTANT FIX)
-    # =====================================================
-    if _goal_timer > 0 and _goal_lane != -1:
-        _goal_timer -= 1
-        return _goal_lane, "goal_locked"
+    # =========================
+    # TRAP ESCAPE (RRV FIX)
+    # =========================
+    if is_trapped(current_lane, red, n):
+        escape = nearest_safe_lane(current_lane, red, n)
+        return escape, "TRAP_ESCAPE"
 
-    # =====================================================
-    # NEW GOAL FROM GREEN
-    # =====================================================
-    new_goal = select_green_goal(tokens, lane_centers, red, yellow, current_lane, frame_h, n)
+    # =========================
+    # GLOBAL SAFE SEARCH (IMPORTANT FIX)
+    # =========================
+    best_lane = current_lane
+    best_score = -1e9
 
-    if new_goal != -1:
-        _goal_lane = new_goal
-        _goal_timer = 25   # HOLD TARGET (VERY IMPORTANT)
-        return _goal_lane, "new_green_goal"
+    for i in range(n):
 
-    # =====================================================
-    # FALLBACK MODE (NO GREEN)
-    # =====================================================
-    candidates = filter_safe(current_lane, red, n)
+        risk = lane_risk_score(i, red, yellow, n)
+        if risk > 800:
+            continue  # avoid dangerous lanes
 
-    best = min(
-        candidates,
-        key=lambda i: score_lane(
-            i, tokens, lane_centers,
-            current_lane, red, yellow, green,
-            frame_h, n
-        )
-    )
-    return best, "safe_navigation"
+        corridor = safe_corridor_score(i, red, yellow, n)
+
+        score = 0
+        score += corridor * 120
+
+        # stability (avoid zigzag)
+        score -= abs(i - current_lane) * 35
+
+        # slight center preference
+        score -= abs(i - n//2) * 10
+
+        # yellow penalty
+        if yellow[i]:
+            score -= 150
+
+        if score > best_score:
+            best_score = score
+            best_lane = i
+
+    return best_lane, "SAFE_CORRIDOR_NAV"
 
 
-# =========================================================
-# CONTROL
-# =========================================================
-def compute_controls(target_lane, lane_centers, frame_w, rear_close):
+# =========================
+# CONTROL (FAST RESPONSE + MOMENTUM)
+# =========================
+def control(target_lane, lane_centers, frame_w, rear_close):
+
+    global _speed_mem
 
     if target_lane < 0:
         return 0.0, 0.6
 
-    target_x = lane_centers[target_lane]
     car_x = frame_w / 2
+    target_x = lane_centers[target_lane]
 
     steering = (target_x - car_x) / (frame_w / 2)
-    steering = max(-1.0, min(1.0, steering))
+    steering = float(np.clip(steering * 0.75, -1, 1))
 
-    accel = 0.95 * (1.0 - 0.75 * abs(steering))
+    # =========================
+    # SPEED MODEL (FIXED)
+    # =========================
+    turn = abs(steering)
 
+    # base speed
+    desired = 0.95
+
+    # turn slows down
+    desired -= 0.5 * turn
+
+    # straight boost (IMPORTANT)
+    if turn < 0.12:
+        desired += 0.03
+
+    # rear pressure
     if rear_close:
-        accel = min(1.0, accel + 0.1)
+        desired += 0.10
 
-    accel = max(0.4, min(1.0, accel))
+    # smooth memory (prevents drop to 0.6 spikes)
+    _speed_mem = _speed_mem * 0.80 + desired * 0.20
+    _speed_mem = float(np.clip(_speed_mem, 0.4, 1.0))
 
-    return float(steering), float(accel)
+    return steering, _speed_mem
 
 
-# =========================================================
+# =========================
 # MAIN LOOP
-# =========================================================
+# =========================
 def driving_logic_task():
 
     global _lane_lock, _lock_counter
-    global _decision_counter, _last_reason
+    global _counter, _last_reason
 
     with data_lock:
         frame = shared_data['latest_front_frame']
@@ -268,62 +263,54 @@ def driving_logic_task():
 
     h, w, _ = frame.shape
 
-    candidate, reason = decide_target_lane(
-        tokens, lane_centers, current_lane, h
-    )
+    target, reason = decide(tokens, lane_centers, current_lane, h)
 
-    # ============================
-    # LANE SMOOTHING
-    # ============================
+    # =========================
+    # FAST LANE LOCK (NO LAG)
+    # =========================
     if _lane_lock == -1:
-        _lane_lock = candidate
+        _lane_lock = target
 
-    elif candidate == _lane_lock:
+    elif target == _lane_lock:
         _lock_counter = 0
 
     else:
         _lock_counter += 1
-        if _lock_counter > 3:
-            _lane_lock = candidate
+        if _lock_counter > 2:  # FAST reaction
+            _lane_lock = target
             _lock_counter = 0
 
-    target_lane = _lane_lock
-
-    steering, accel = compute_controls(
-        target_lane, lane_centers, w, rear_close
-    )
+    steer, accel = control(_lane_lock, lane_centers, w, rear_close)
 
     with data_lock:
-        shared_data['target_lane'] = target_lane
+        shared_data['target_lane'] = _lane_lock
         shared_data['decision_reason'] = reason
-        shared_data['steering_input'] = steering
+        shared_data['steering_input'] = steer
         shared_data['acceleration_input'] = accel
 
-    _decision_counter += 1
-
-    if reason != _last_reason or _decision_counter % PRINT_EVERY == 0:
-        print(
-            f"[STABLE-AI] {reason:<18} "
-            f"{current_lane}->{target_lane} "
-            f"steer={steering:+.2f} accel={accel:.2f}"
-        )
+    # =========================
+    # DEBUG
+    # =========================
+    _counter += 1
+    if _counter % PRINT_EVERY == 0 or reason != _last_reason:
+        print(f"[V10] {reason:<14} lane={current_lane}->{_lane_lock} "
+              f"steer={steer:+.2f} accel={accel:.2f}")
         _last_reason = reason
 
 
-# =========================================================
-# SEND CONTROL
-# =========================================================
+# =========================
+# SEND
+# =========================
 def send_controls_task():
-
     if comms.control_conn is None:
         return
 
     with data_lock:
-        steering = shared_data['steering_input']
-        accel = shared_data['acceleration_input']
+        s = shared_data['steering_input']
+        a = shared_data['acceleration_input']
 
     try:
-        comms.control_conn.sendall(struct.pack('ff', steering, accel))
+        comms.control_conn.sendall(struct.pack('ff', s, a))
     except Exception as e:
-        print("Control send error:", e)
+        print("send error:", e)
         comms.control_conn = None
