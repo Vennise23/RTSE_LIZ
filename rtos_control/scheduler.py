@@ -139,11 +139,12 @@ class TaskRuntime:
         self._loggers: List[TaskLogger] = []
         self._stop_event = threading.Event()
 
-    def add(self, spec: TaskSpec) -> PeriodicTask:
+    def add(self, spec: TaskSpec, *, enable_logging: bool = True) -> PeriodicTask:
         logger = TaskLogger(
             task_name=spec.name,
             period=spec.period,
             deadline=spec.deadline_value(),
+            enabled=enable_logging,
         )
         task = PeriodicTask(spec, self._stop_event, logger)
         self._tasks.append(task)

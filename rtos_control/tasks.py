@@ -77,6 +77,10 @@ def build_decision_task(
         result = decide(snap.state, memory[0])
         memory[0] = result.memory
         _enqueue_latest(command_q, result.command)
+        if memory[0].low_light_active:
+            return f"LOW_LIGHT detected brightness={snap.state.brightness:.2f}"
+        if snap.state.brightness < config.LOW_LIGHT_THRESHOLD:
+            return f"LOW_LIGHT pending brightness={snap.state.brightness:.2f}"
         return result.command.kind.value
     return body
 
@@ -167,6 +171,8 @@ def _command_to_floats(cmd: Command, now: float):
         return (0.0, config.ACCEL_SLOWDOWN, now)
     if cmd.kind is CommandKind.SPEED_UP:
         return (0.0, config.ACCEL_CRUISE, now)
+    if cmd.kind is CommandKind.RECOVER_LIGHT:
+        return (0.0, -1.0, now)
     if cmd.kind is CommandKind.DEGRADE:
         return (0.0, config.ACCEL_BRAKE, now)
     # HOLD

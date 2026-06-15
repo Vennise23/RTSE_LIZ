@@ -84,13 +84,17 @@ class TaskLogger:
         period: float,
         deadline: Optional[float] = None,
         log_dir: str = config.LOG_DIR,
+        enabled: bool = True,
     ) -> None:
-        os.makedirs(log_dir, exist_ok=True)
-        path = os.path.join(log_dir, f"{task_name}.csv")
-        self._path = path
-        self._fh = open(path, "w", newline="", encoding="utf-8")
-        self._writer = csv.writer(self._fh)
-        self._writer.writerow(CSV_HEADER)
+        self._enabled = enabled
+        self._path = os.path.join(log_dir, f"{task_name}.csv")
+        self._fh = None
+        self._writer = None
+        if self._enabled:
+            os.makedirs(log_dir, exist_ok=True)
+            self._fh = open(self._path, "w", newline="", encoding="utf-8")
+            self._writer = csv.writer(self._fh)
+            self._writer.writerow(CSV_HEADER)
         self._unflushed = 0
         self._stats_lock = threading.Lock()
         self.stats = TaskStats(
@@ -113,23 +117,25 @@ class TaskLogger:
         finish = release_time + exec_time
         deadline_abs = release_time + self.stats.deadline
         missed = finish > deadline_abs
-        self._writer.writerow([
-            release_idx,
-            f"{release_time:.9f}",
-            f"{exec_time:.9f}",
-            f"{self.stats.period:.9f}",
-            f"{self.stats.deadline:.9f}",
-            f"{finish:.9f}",
-            f"{deadline_abs:.9f}",
-            1 if missed else 0,
-            note,
-        ])
+        if self._writer is not None:
+            self._writer.writerow([
+                release_idx,
+                f"{release_time:.9f}",
+                f"{exec_time:.9f}",
+                f"{self.stats.period:.9f}",
+                f"{self.stats.deadline:.9f}",
+                f"{finish:.9f}",
+                f"{deadline_abs:.9f}",
+                1 if missed else 0,
+                note,
+            ])
         with self._stats_lock:
             self.stats.record(exec_time, missed)
-        self._unflushed += 1
-        if self._unflushed >= config.LOG_FLUSH_EVERY:
-            self._fh.flush()
-            self._unflushed = 0
+        if self._fh is not None:
+            self._unflushed += 1
+            if self._unflushed >= config.LOG_FLUSH_EVERY:
+                self._fh.flush()
+                self._unflushed = 0
         return missed
 
     def snapshot_stats(self) -> TaskStats:
@@ -148,6 +154,8 @@ class TaskLogger:
             )
 
     def close(self) -> None:
+        if self._fh is None:
+            return
         try:
             self._fh.flush()
             self._fh.close()

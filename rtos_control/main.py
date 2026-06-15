@@ -39,11 +39,14 @@ def _parse_args(argv) -> argparse.Namespace:
                    help="Mock world RNG seed (mock mode only).")
     p.add_argument("--no-overlay", action="store_true",
                    help="Disable the live perception overlay window (real mode only).")
+    p.add_argument("--summary", action="store_true",
+                   help="Print the end-of-run per-task summary.")
     return p.parse_args(argv)
 
 
 def _build_runtime(game: GameInterface, shared: SharedState, command_q: "queue.Queue[Command]"):
     runtime = TaskRuntime()
+    enable_logging = config.ENABLE_CSV_LOGGING
 
     # We need to give Watchdog references to the loggers of the other
     # tasks. Build them first, then build watchdog last with the list.
@@ -52,19 +55,19 @@ def _build_runtime(game: GameInterface, shared: SharedState, command_q: "queue.Q
         period=config.TASK_PERCEPTION_PERIOD,
         priority=config.TASK_PERCEPTION_PRIORITY,
         body=build_perception_task(game, shared),
-    ))
+    ), enable_logging=enable_logging)
     actuation_task = runtime.add(TaskSpec(
         name="Actuation",
         period=config.TASK_ACTUATION_PERIOD,
         priority=config.TASK_ACTUATION_PRIORITY,
         body=build_actuation_task(game, shared, command_q),
-    ))
+    ), enable_logging=enable_logging)
     decision_task = runtime.add(TaskSpec(
         name="Decision",
         period=config.TASK_DECISION_PERIOD,
         priority=config.TASK_DECISION_PRIORITY,
         body=build_decision_task(shared, command_q),
-    ))
+    ), enable_logging=enable_logging)
     watchdog_task = runtime.add(TaskSpec(
         name="Watchdog",
         period=config.TASK_WATCHDOG_PERIOD,
@@ -76,7 +79,7 @@ def _build_runtime(game: GameInterface, shared: SharedState, command_q: "queue.Q
                                decision_task.logger,
                                actuation_task.logger],
         ),
-    ))
+    ), enable_logging=enable_logging)
     return runtime
 
 
@@ -104,7 +107,6 @@ def main(argv: Optional[list] = None) -> int:
 
     # Install a Ctrl+C handler that flips the stop event.
     def _sigint(_signo, _frame):
-        print("\n[main] SIGINT received, stopping...")
         runtime.stop_event.set()
     signal.signal(signal.SIGINT, _sigint)
 
@@ -121,12 +123,16 @@ def main(argv: Optional[list] = None) -> int:
         runtime.stop_all()
         game.stop()
 
-    print("\n[main] Run complete. Per-task summary:")
-    print(format_stats_table(runtime.loggers))
-    print("\n[main] CSV logs written to:")
-    for lg in runtime.loggers:
-        print(f"  - {lg.path}")
-    print("\n[main] Next step: python -m rtos_control.schedulability_analysis")
+    if args.summary or config.SHOW_END_SUMMARY:
+        print("\n[main] Run complete. Per-task summary:")
+        print(format_stats_table(runtime.loggers))
+    if config.ENABLE_CSV_LOGGING:
+        print("\n[main] CSV logs written to:")
+        for lg in runtime.loggers:
+            print(f"  - {lg.path}")
+        print("\n[main] Next step: python -m rtos_control.schedulability_analysis")
+    else:
+        print("\n[main] CSV logging is disabled.")
     return 0
 
 

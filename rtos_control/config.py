@@ -69,6 +69,14 @@ GREEN_REWARD   = 1.0
 RED_PENALTY    = 20.0
 YELLOW_PENALTY = 2.0
 
+# ----------------------------------------------------------------------
+# Challenge 1: low-light handling
+# ----------------------------------------------------------------------
+# When perceived brightness drops below this threshold, switch to the
+# recovery mode described in the challenge.
+LOW_LIGHT_THRESHOLD = 0.25
+# Require a little persistence so we do not flicker in and out on noise.
+LOW_LIGHT_CONFIRM_FRAMES = 3
 # How strongly nearer tokens count vs far ones. The reward of a token is
 # weight * max(0, 1 - distance / LOOKAHEAD_eff).
 REWARD_DECAY_NEAR_BIAS = 1.0   # linear falloff; tune up for sharper preference for close tokens
@@ -96,6 +104,8 @@ WATCHDOG_STALE_STATE_SEC = 0.15
 # ----------------------------------------------------------------------
 # Instrumentation
 # ----------------------------------------------------------------------
+ENABLE_CSV_LOGGING = False
+SHOW_END_SUMMARY = False
 LOG_DIR = "logs"
 LOG_FLUSH_EVERY = 50           # flush CSV every N rows to bound IO overhead
 
@@ -104,7 +114,6 @@ LOG_FLUSH_EVERY = 50           # flush CSV every N rows to bound IO overhead
 # ----------------------------------------------------------------------
 GAME_CAMERA_HOST = "127.0.0.1"
 GAME_FRONT_CAMERA_PORT = 8080
-GAME_BACK_CAMERA_PORT  = 8082
 GAME_CONTROL_HOST = "127.0.0.1"
 GAME_CONTROL_PORT = 8081
 

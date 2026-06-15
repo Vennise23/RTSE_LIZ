@@ -178,6 +178,9 @@ class MockGameInterface(GameInterface):
                 timestamp=time.perf_counter(),
                 own_lane=self._own_lane,
                 speed_norm=self._speed_norm,
+                brightness=1.0,
+                rear_pressure=0.0,
+                police_alert=False,
                 tokens=tuple(self._tokens),
                 obstacles=tuple(self._obstacles),
                 perception_healthy=True,
@@ -341,9 +344,10 @@ class RealGameInterface(GameInterface):
                 if frame is None:
                     self._mark_unhealthy()
                     continue
+                brightness = self._estimate_brightness(frame, cv2, np)
                 enriched = self._detect_tokens(frame, cv2, np)
                 tokens = tuple(item[0] for item in enriched)
-                self._update_state_from_perception(frame.shape, tokens)
+                self._update_state_from_perception(frame.shape, brightness, tokens)
                 if self._show_overlay:
                     try:
                         self._render_overlay(frame, enriched, cv2)
@@ -361,12 +365,13 @@ class RealGameInterface(GameInterface):
                 timestamp=time.perf_counter(),
                 own_lane=int(round(self._own_lane_float)),
                 speed_norm=max(0.0, min(1.0, self._last_acceleration)),
+                brightness=1.0,
                 tokens=(),
                 obstacles=(),
                 perception_healthy=False,
             )
 
-    def _update_state_from_perception(self, frame_shape, tokens) -> None:
+    def _update_state_from_perception(self, frame_shape, brightness, tokens) -> None:
         # Integrate own lane from steering: +1 = right at LANE_HOLD_TIME pace.
         now = time.perf_counter()
         if self._last_command_at is not None:
@@ -386,10 +391,17 @@ class RealGameInterface(GameInterface):
                 # throttle as a proxy. Decision uses this only to widen
                 # look-ahead, so the proxy is good enough.
                 speed_norm=max(0.0, min(1.0, self._last_acceleration)),
+                brightness=brightness,
                 tokens=tokens,
                 obstacles=(),  # Phase-1 token game has no obstacles per se
                 perception_healthy=True,
             )
+
+    @staticmethod
+    def _estimate_brightness(frame, cv2, np) -> float:
+        """Estimate normalized brightness from the decoded front camera frame."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return max(0.0, min(1.0, float(np.mean(gray)) / 255.0))
 
     @staticmethod
     def _detect_tokens(frame, cv2, np) -> list:
@@ -548,10 +560,15 @@ class RealGameInterface(GameInterface):
         # 6. Status bar (top)
         bar_h = 28
         cv2.rectangle(out, (0, 0), (w, bar_h), (28, 28, 28), -1)
+        snap = self.read_state()
+        brightness = getattr(snap, "brightness", 1.0)
         status = (f"R={counts[TokenColor.RED]} "
                   f"G={counts[TokenColor.GREEN]} "
                   f"Y={counts[TokenColor.YELLOW]}    "
-                  f"ACT={self._actuation_label()}")
+                  f"B={brightness:.2f} "
+                  f"TH={config.LOW_LIGHT_THRESHOLD:.2f}    "
+                  f"ACT={self._actuation_label()}    "
+                  f"{self._status_label()}")
         cv2.putText(out, status, (10, 19),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 1, cv2.LINE_AA)
 
@@ -622,6 +639,13 @@ class RealGameInterface(GameInterface):
         if not parts:
             parts.append("CRUISE")
         return "|".join(parts)
+
+    def _status_label(self) -> str:
+        """Add a compact status tag for challenge states."""
+        snap = self.read_state()
+        if getattr(snap, "brightness", 1.0) < config.LOW_LIGHT_THRESHOLD:
+            return "LOW_LIGHT"
+        return "NORMAL"
 
     @staticmethod
     def _lane_for_x(x: int, lane_bounds) -> Optional[int]:
