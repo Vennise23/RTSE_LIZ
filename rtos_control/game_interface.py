@@ -96,6 +96,26 @@ class MockGameInterface(GameInterface):
         self._obstacle_spawn_period = 1.0 / max(obstacle_spawn_hz, 1e-6)
         self._next_token_spawn = 0.0
         self._next_obstacle_spawn = 0.0
+        self._run_started_at: Optional[float] = None
+        self._low_light_active = False
+        self._low_light_started_at = 0.0
+        self._low_light_applied = False
+        self._rear_chase_count = 0
+        self._rear_chase_active = False
+        self._rear_chase_started_at = 0.0
+        self._rear_chase_expires_at = 0.0
+        self._rear_chase_lane = -1
+        self._rear_pressure = 0.0
+        self._chase_collision_done = False
+        self._police_active = False
+        self._police_started_at = 0.0
+        self._police_expires_at = 0.0
+        self._police_lane = -1
+        self._police_collision_done = False
+        self._police_appear_at = 0.0
+        self._last_player_red_token = 0.0
+        self._game_over = False
+        self._game_over_reason = ""
         # Effect of the last steering command: positive = steering right.
         self._steering = 0.0
         self._acceleration = 1.0
@@ -104,9 +124,13 @@ class MockGameInterface(GameInterface):
     # ---- lifecycle ------------------------------------------------
     def start(self) -> None:
         now = time.perf_counter()
+        self._run_started_at = now
         self._last_step_time = now
         self._next_token_spawn = now
         self._next_obstacle_spawn = now + 1.0
+        self._police_appear_at = config.POLICE_CAR_MIN_APPEAR_SEC + self._rng.random() * (
+            config.POLICE_CAR_MAX_APPEAR_SEC - config.POLICE_CAR_MIN_APPEAR_SEC
+        )
         self._started = True
 
     def stop(self) -> None:
@@ -122,6 +146,14 @@ class MockGameInterface(GameInterface):
         dt = now - self._last_step_time
         self._last_step_time = now
 
+        self._update_low_light(now, dt)
+        self._update_chase_state(now, dt)
+        self._update_police_state(now, dt)
+
+        if self._game_over:
+            self._speed_norm = 0.0
+            return
+
         # Lane integration: steering of +/-1 sweeps one lane in ~0.4 s.
         lane_rate = self._steering * 2.5
         self._lane_float = max(0.0, min(float(config.NUM_LANES - 1),
@@ -132,6 +164,13 @@ class MockGameInterface(GameInterface):
         self._speed_norm = max(0.0, min(1.0, self._speed_norm + 0.4 * self._acceleration * dt - 0.05 * dt))
         if self._speed_norm < 0.05:
             self._speed_norm = 0.05  # never fully stop in mock so flow stays interesting
+        if self._low_light_active:
+            self._speed_norm *= config.LOW_LIGHT_SPEED_PENALTY_FACTOR
+
+        if self._rear_chase_active and self._rear_chase_lane == self._own_lane and not self._chase_collision_done:
+            self._speed_norm *= config.CHASE_CAR_SPEED_PENALTY_FACTOR
+            self._chase_collision_done = True
+            self._rear_pressure = 1.0
 
         # Tokens drift toward us at a rate proportional to speed_norm.
         flow = max(0.05, self._speed_norm) * 0.8
@@ -167,6 +206,100 @@ class MockGameInterface(GameInterface):
             ))
             self._next_obstacle_spawn += self._obstacle_spawn_period
 
+    def _update_low_light(self, now: float, dt: float) -> None:
+        if self._run_started_at is None:
+            self._run_started_at = now
+        elapsed = now - self._run_started_at
+        if not self._low_light_active and elapsed >= config.LOW_LIGHT_TRIGGER_SEC:
+            self._low_light_active = True
+            self._low_light_started_at = now
+            self._low_light_applied = False
+            # All tokens become unknown while the light is off.
+            self._tokens = tuple(
+                Token(lane=t.lane, distance=t.distance, color=TokenColor.YELLOW)
+                for t in self._tokens
+            )
+        if self._low_light_active:
+            self._rear_pressure = max(self._rear_pressure, 0.2)
+            if self._acceleration <= -0.9:
+                self._low_light_active = False
+                self._low_light_applied = True
+
+    def _update_police_state(self, now: float, dt: float) -> None:
+        if self._run_started_at is None:
+            self._run_started_at = now
+        elapsed = now - self._run_started_at
+        if not self._police_active and not self._game_over:
+            if elapsed >= self._police_appear_at:
+                self._police_active = True
+                self._police_started_at = now
+                self._police_expires_at = now + config.POLICE_CAR_WINDOW_SEC
+                self._police_lane = self._own_lane
+                self._police_collision_done = False
+                self._last_player_red_token = 0.0
+
+        if not self._police_active:
+            return
+
+        if self._police_lane == self._own_lane and not self._police_collision_done:
+            self._game_over = True
+            self._game_over_reason = "police_car_collision"
+            return
+
+        if self._last_player_red_token > 0.0 and (now - self._last_player_red_token) <= 1.5:
+            self._police_active = False
+            self._police_lane = -1
+            self._police_collision_done = True
+            self._speed_norm *= config.POLICE_CAR_SPEED_PENALTY_FACTOR
+            return
+
+        if now >= self._police_expires_at:
+            self._police_active = False
+            self._police_lane = -1
+            self._speed_norm *= config.POLICE_CAR_SPEED_PENALTY_FACTOR
+
+    def _mark_red_token_taken(self, now: float) -> None:
+        self._last_player_red_token = now
+
+    def _update_chase_state(self, now: float, dt: float) -> None:
+        """Trigger the two chase-car appearances and update pressure."""
+        if self._run_started_at is None:
+            self._run_started_at = now
+        elapsed = now - self._run_started_at
+
+        starts = [
+            (config.CHASE_CAR_FIRST_APPEAR_SEC, config.CHASE_CAR_FIRST_WINDOW_SEC),
+            (config.CHASE_CAR_SECOND_APPEAR_SEC, config.CHASE_CAR_SECOND_WINDOW_SEC),
+        ]
+
+        if self._rear_chase_count < len(starts):
+            appear_at, window = starts[self._rear_chase_count]
+            if elapsed >= appear_at and not self._rear_chase_active:
+                self._rear_chase_active = True
+                self._rear_chase_started_at = now
+                self._rear_chase_expires_at = now + window
+                self._rear_chase_lane = self._own_lane
+                self._rear_pressure = 0.0
+                self._chase_collision_done = False
+                self._rear_chase_count += 1
+
+        if not self._rear_chase_active:
+            self._rear_pressure = max(0.0, self._rear_pressure - 0.3 * dt)
+            return
+
+        time_left = self._rear_chase_expires_at - now
+        if time_left <= 0.0:
+            self._rear_chase_active = False
+            self._rear_chase_lane = -1
+            self._rear_pressure = 0.0
+            self._chase_collision_done = False
+            return
+
+        self._rear_pressure = min(
+            1.0,
+            self._rear_pressure + config.CHASE_CAR_PRESSURE_RISE_PER_SEC * dt,
+        )
+
     # ---- GameInterface impl ---------------------------------------
     def read_state(self) -> GameState:
         if not self._started:
@@ -178,9 +311,19 @@ class MockGameInterface(GameInterface):
                 timestamp=time.perf_counter(),
                 own_lane=self._own_lane,
                 speed_norm=self._speed_norm,
-                brightness=1.0,
-                rear_pressure=0.0,
-                police_alert=False,
+                brightness=0.1 if self._low_light_active else 1.0,
+                low_light_active=self._low_light_active,
+                rear_pressure=self._rear_pressure,
+                rear_chase_active=self._rear_chase_active,
+                rear_chase_lane=self._rear_chase_lane,
+                rear_time_left=max(0.0, self._rear_chase_expires_at - time.perf_counter())
+                    if self._rear_chase_active else 0.0,
+                police_alert=self._police_active,
+                police_lane=self._police_lane,
+                police_time_left=max(0.0, self._police_expires_at - time.perf_counter())
+                    if self._police_active else 0.0,
+                game_over=self._game_over,
+                game_over_reason=self._game_over_reason,
                 tokens=tuple(self._tokens),
                 obstacles=tuple(self._obstacles),
                 perception_healthy=True,
@@ -366,6 +509,16 @@ class RealGameInterface(GameInterface):
                 own_lane=int(round(self._own_lane_float)),
                 speed_norm=max(0.0, min(1.0, self._last_acceleration)),
                 brightness=1.0,
+                low_light_active=False,
+                rear_pressure=0.0,
+                rear_chase_active=False,
+                rear_chase_lane=-1,
+                rear_time_left=0.0,
+                police_alert=False,
+                police_lane=-1,
+                police_time_left=0.0,
+                game_over=False,
+                game_over_reason="",
                 tokens=(),
                 obstacles=(),
                 perception_healthy=False,
@@ -392,6 +545,16 @@ class RealGameInterface(GameInterface):
                 # look-ahead, so the proxy is good enough.
                 speed_norm=max(0.0, min(1.0, self._last_acceleration)),
                 brightness=brightness,
+                low_light_active=brightness < config.LOW_LIGHT_THRESHOLD,
+                rear_pressure=0.0,
+                rear_chase_active=False,
+                rear_chase_lane=-1,
+                rear_time_left=0.0,
+                police_alert=False,
+                police_lane=-1,
+                police_time_left=0.0,
+                game_over=False,
+                game_over_reason="",
                 tokens=tokens,
                 obstacles=(),  # Phase-1 token game has no obstacles per se
                 perception_healthy=True,

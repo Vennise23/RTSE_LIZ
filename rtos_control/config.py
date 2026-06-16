@@ -77,9 +77,38 @@ YELLOW_PENALTY = 2.0
 LOW_LIGHT_THRESHOLD = 0.25
 # Require a little persistence so we do not flicker in and out on noise.
 LOW_LIGHT_CONFIRM_FRAMES = 3
+# Mock-only: trigger the low-light event once in the opening 10 seconds.
+LOW_LIGHT_TRIGGER_SEC = 5.0
+# While the light is off, other control actions reduce speed by 10%.
+LOW_LIGHT_SPEED_PENALTY_FACTOR = 0.9
 # How strongly nearer tokens count vs far ones. The reward of a token is
 # weight * max(0, 1 - distance / LOOKAHEAD_eff).
 REWARD_DECAY_NEAR_BIAS = 1.0   # linear falloff; tune up for sharper preference for close tokens
+
+# ----------------------------------------------------------------------
+# Challenge 2: chasing car
+# ----------------------------------------------------------------------
+# The rear chase appears twice during a run in mock mode.
+CHASE_CAR_FIRST_APPEAR_SEC = 6.0
+CHASE_CAR_SECOND_APPEAR_SEC = 18.0
+# Time allowed to avoid the chase car after it appears.
+CHASE_CAR_FIRST_WINDOW_SEC = 10.0
+CHASE_CAR_SECOND_WINDOW_SEC = 3.0
+# Mock-only: lane windows to make the chase appear behind the player.
+CHASE_CAR_LANE_DRIFT_PER_SEC = 0.18
+# If the chase car "hits" the player, reduce speed to 50% immediately.
+CHASE_CAR_SPEED_PENALTY_FACTOR = 0.5
+# Mock-only geometry: how quickly the rear pressure rises once the event starts.
+CHASE_CAR_PRESSURE_RISE_PER_SEC = 0.18
+
+# ----------------------------------------------------------------------
+# Challenge 3: police car
+# ----------------------------------------------------------------------
+POLICE_CAR_MIN_APPEAR_SEC = 8.0
+POLICE_CAR_MAX_APPEAR_SEC = 28.0
+POLICE_CAR_WINDOW_SEC = 10.0
+POLICE_CAR_REQUIRED_TOKEN_COLOR = "red"
+POLICE_CAR_SPEED_PENALTY_FACTOR = 0.5
 
 # ----------------------------------------------------------------------
 # Actuation calibration (rule-based mapping from lane decision -> floats)

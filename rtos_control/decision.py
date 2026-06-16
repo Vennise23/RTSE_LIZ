@@ -35,6 +35,9 @@ SIDE_CLEAR_BAND = 0.04
 GREEN_GAIN = 1.0
 YELLOW_COST = 0.45
 RED_COST = 3.0
+# Favor green collection aggressively, but avoid lane-flapping.
+GREEN_CHASE_MIN = 0.10
+GREEN_SWITCH_COOLDOWN_SEC = 0.40
 
 
 def _effective_lookahead(speed_norm: float) -> float:
@@ -162,6 +165,8 @@ class DecisionMemory:
     low_light_count: int = 0
     low_light_active: bool = False
     low_light_recovery_sent: bool = False
+    police_alert_seen: bool = False
+    game_over_seen: bool = False
 
 
 @dataclass
@@ -184,6 +189,11 @@ def decide(
     own_x = _own_x_pos(state)
     lookahead = _effective_lookahead(state.speed_norm)
     brake_dist = config.BRAKE_DIST
+    left_score = _side_score(state, own_x, lookahead, "left")
+    right_score = _side_score(state, own_x, lookahead, "right")
+    center_score = _side_score(state, own_x, lookahead, "center")
+    left_green = _side_green_score(state, own_x, lookahead, "left")
+    right_green = _side_green_score(state, own_x, lookahead, "right")
     low_light_count = (
         memory.low_light_count + 1
         if state.brightness < config.LOW_LIGHT_THRESHOLD
@@ -206,11 +216,70 @@ def decide(
         )
         return DecisionResult(cmd, memory)
 
-    left_score = _side_score(state, own_x, lookahead, "left")
-    right_score = _side_score(state, own_x, lookahead, "right")
-    center_score = _side_score(state, own_x, lookahead, "center")
-    left_green = _side_green_score(state, own_x, lookahead, "left")
-    right_green = _side_green_score(state, own_x, lookahead, "right")
+    if getattr(state, "game_over", False):
+        memory = DecisionMemory(
+            last_switch_time=memory.last_switch_time,
+            last_command_kind=CommandKind.HOLD,
+            low_light_count=low_light_count,
+            low_light_active=low_light_active,
+            low_light_recovery_sent=memory.low_light_recovery_sent,
+            police_alert_seen=getattr(state, "police_alert", False) or memory.police_alert_seen,
+            game_over_seen=True,
+        )
+        cmd = Command(
+            kind=CommandKind.HOLD,
+            issued_at=now,
+            reason=f"game_over:{getattr(state, 'game_over_reason', 'unknown')}",
+        )
+        return DecisionResult(cmd, memory)
+
+    if getattr(state, "police_alert", False):
+        chase_lane = int(getattr(state, "rear_chase_lane", -1))
+        time_left = float(getattr(state, "rear_time_left", 0.0))
+        chase_reason = f"rear_chase_lane={chase_lane} time_left={time_left:.1f}"
+        memory = DecisionMemory(
+            last_switch_time=memory.last_switch_time,
+            last_command_kind=memory.last_command_kind,
+            low_light_count=low_light_count,
+            low_light_active=low_light_active,
+            low_light_recovery_sent=memory.low_light_recovery_sent,
+            police_alert_seen=True,
+            game_over_seen=False,
+        )
+
+        left_safe = not _side_has_near_red(state, own_x, brake_dist, "left")
+        right_safe = not _side_has_near_red(state, own_x, brake_dist, "right")
+        if left_safe or right_safe:
+            if left_safe and right_safe:
+                best_side = "left" if left_score >= right_score else "right"
+            else:
+                best_side = "left" if left_safe else "right"
+            kind = CommandKind.MOVE_LEFT if best_side == "left" else CommandKind.MOVE_RIGHT
+            memory = DecisionMemory(
+                last_switch_time=now,
+                last_command_kind=kind,
+                low_light_count=low_light_count,
+                low_light_active=low_light_active,
+            )
+            cmd = Command(
+                kind=kind,
+                issued_at=now,
+                reason=f"avoid_chasing_car_to_{best_side};{chase_reason}",
+            )
+            return DecisionResult(cmd, memory)
+
+        memory = DecisionMemory(
+            last_switch_time=memory.last_switch_time,
+            last_command_kind=CommandKind.SLOW_DOWN,
+            low_light_count=low_light_count,
+            low_light_active=low_light_active,
+        )
+        cmd = Command(
+            kind=CommandKind.SLOW_DOWN,
+            issued_at=now,
+            reason=f"chasing_car_no_clear_side;{chase_reason}",
+        )
+        return DecisionResult(cmd, memory)
 
     # 1. Safety: if a red is straight ahead, move to the safer side.
     if _front_red_ahead(state, own_x, brake_dist):
@@ -250,12 +319,37 @@ def decide(
         )
         return DecisionResult(cmd, memory)
 
-    # 2. Reward: if one side has a clear green advantage, go there.
+    if getattr(state, "low_light_active", False):
+        memory = DecisionMemory(
+            last_switch_time=memory.last_switch_time,
+            last_command_kind=CommandKind.RECOVER_LIGHT,
+            low_light_count=low_light_count,
+            low_light_active=low_light_active,
+            low_light_recovery_sent=True,
+            police_alert_seen=getattr(state, "police_alert", False),
+            game_over_seen=memory.game_over_seen,
+        )
+        cmd = Command(
+            kind=CommandKind.RECOVER_LIGHT,
+            issued_at=now,
+            reason="low_light_recovery",
+        )
+        return DecisionResult(cmd, memory)
+
+    # 2. Reward: if one side has a green target and it is safe, go there.
     best_side = "left" if left_green >= right_green else "right"
     best_green = max(left_green, right_green)
+    other_green = min(left_green, right_green)
     side_score = left_score if best_side == "left" else right_score
+    green_edge = best_green - other_green
+    best_side_safe = not _side_has_near_red(state, own_x, brake_dist, best_side)
+    green_recently_switched = (now - memory.last_switch_time) < GREEN_SWITCH_COOLDOWN_SEC
 
-    if best_green > 0.0 and side_score > -RED_COST:
+    if best_green > 0.0 and best_side_safe and (
+        green_edge >= config.SWITCH_MARGIN
+        or best_green >= GREEN_CHASE_MIN
+        or not green_recently_switched
+    ):
         kind = CommandKind.MOVE_LEFT if best_side == "left" else CommandKind.MOVE_RIGHT
         memory = DecisionMemory(
             last_switch_time=now,
@@ -272,7 +366,7 @@ def decide(
 
     # 3. Stability: keep cruising unless the center is saturated with bad colors.
     # Low-light is only observed/logged for now; it does not change actuation.
-    if center_score < -config.GREEN_REWARD:
+    if center_score < -(config.GREEN_REWARD * 1.25):
         memory = DecisionMemory(
             last_switch_time=memory.last_switch_time,
             last_command_kind=CommandKind.SLOW_DOWN,

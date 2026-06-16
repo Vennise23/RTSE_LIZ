@@ -32,6 +32,8 @@ def build_perception_task(game: GameInterface, shared: SharedState):
     def body() -> Optional[str]:
         state = game.read_state()
         shared.update_state(state)
+        if getattr(state, "game_over", False):
+            return f"GAME_OVER:{getattr(state, 'game_over_reason', 'unknown')}"
         if not state.perception_healthy:
             return "perception_unhealthy"
         return ""
@@ -50,6 +52,14 @@ def build_decision_task(
 
     def body() -> Optional[str]:
         snap = shared.snapshot()
+        if getattr(snap.state, "game_over", False):
+            cmd = Command(
+                kind=CommandKind.HOLD,
+                issued_at=time.perf_counter(),
+                reason=f"game_over:{getattr(snap.state, 'game_over_reason', 'unknown')}",
+            )
+            _enqueue_latest(command_q, cmd)
+            return "game_over"
         # If perception is stale we should not act on it. Push a HOLD
         # so actuation just keeps the wheel centred and let watchdog
         # decide whether to escalate.
