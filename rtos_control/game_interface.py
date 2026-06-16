@@ -350,6 +350,7 @@ class RealGameInterface(GameInterface):
     def __init__(self, show_overlay: bool = True) -> None:
         # Networking
         self._front_sock: Optional[socket.socket] = None
+        self._back_sock: Optional[socket.socket] = None
         self._control_server: Optional[socket.socket] = None
         self._control_conn: Optional[socket.socket] = None
         self._setup_thread: Optional[threading.Thread] = None
@@ -363,7 +364,8 @@ class RealGameInterface(GameInterface):
         # Reader thread keeps the camera socket drained at the speed the
         # game produces frames. ``read_state`` then returns a cached
         # snapshot in O(1).
-        self._reader_thread: Optional[threading.Thread] = None
+        self._front_reader_thread: Optional[threading.Thread] = None
+        self._back_reader_thread: Optional[threading.Thread] = None
 
         # Lane-of-self tracking (we never get told, so we integrate from
         # our own steering commands). 0 .. NUM_LANES-1.
@@ -381,13 +383,17 @@ class RealGameInterface(GameInterface):
         # draw the HUD inside it).
         self._show_overlay = show_overlay
         self._overlay_window = "RTOS Perception (RTSE)"
+        self._back_overlay_window = "RTOS Back Camera (RTSE)"
         self._overlay_window_ready = False
+        self._back_overlay_window_ready = False
 
         # Brightness smoothing so brief yellow-flash / visual effects do
         # not get misclassified as a real low-light event.
         self._brightness_history = []
         self._smoothed_brightness_history = []
         self._low_brightness_started_at = None
+        self._back_frame_lock = threading.Lock()
+        self._latest_back_frame = None
 
     # ---- lifecycle ------------------------------------------------
     def start(self) -> None:
@@ -396,14 +402,18 @@ class RealGameInterface(GameInterface):
             target=self._setup_network, name="RealGameSetup", daemon=True,
         )
         self._setup_thread.start()
-        self._reader_thread = threading.Thread(
+        self._front_reader_thread = threading.Thread(
             target=self._camera_reader_loop, name="FrontCameraReader", daemon=True,
         )
-        self._reader_thread.start()
+        self._front_reader_thread.start()
+        self._back_reader_thread = threading.Thread(
+            target=self._back_camera_reader_loop, name="BackCameraReader", daemon=True,
+        )
+        self._back_reader_thread.start()
 
     def stop(self) -> None:
         self._running = False
-        for sock in (self._front_sock, self._control_conn, self._control_server):
+        for sock in (self._front_sock, self._back_sock, self._control_conn, self._control_server):
             try:
                 if sock is not None:
                     sock.close()
@@ -414,13 +424,14 @@ class RealGameInterface(GameInterface):
             try:
                 import cv2  # type: ignore
                 cv2.destroyWindow(self._overlay_window)
+                cv2.destroyWindow(self._back_overlay_window)
                 cv2.waitKey(1)
             except Exception:
                 pass
 
     # ---- networking ------------------------------------------------
     def _setup_network(self) -> None:
-        """Connect to the front camera and accept a control connection."""
+        """Connect to both cameras and accept a control connection."""
         # Front camera
         while self._running and self._front_sock is None:
             try:
@@ -430,6 +441,18 @@ class RealGameInterface(GameInterface):
                 s.settimeout(None)
                 self._front_sock = s
                 print("[RealGameInterface] Front camera connected.")
+            except OSError:
+                time.sleep(0.5)
+
+        # Back camera
+        while self._running and self._back_sock is None:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1.0)
+                s.connect((config.GAME_CAMERA_HOST, config.GAME_BACK_CAMERA_PORT))
+                s.settimeout(None)
+                self._back_sock = s
+                print("[RealGameInterface] Back camera connected.")
             except OSError:
                 time.sleep(0.5)
 
@@ -507,6 +530,42 @@ class RealGameInterface(GameInterface):
                         pass
             except OSError:
                 self._mark_unhealthy()
+                break
+
+    def _back_camera_reader_loop(self) -> None:
+        """Read the back camera stream and keep its window alive."""
+        try:
+            import cv2  # type: ignore
+        except ImportError:
+            print("[RealGameInterface] OpenCV not installed; back camera window disabled.")
+            return
+
+        while self._running and self._back_sock is None:
+            time.sleep(0.05)
+
+        sock = self._back_sock
+        while self._running and sock is not None:
+            try:
+                length_bytes = sock.recv(4)
+                if not length_bytes or len(length_bytes) < 4:
+                    break
+                image_length = int.from_bytes(length_bytes, "little")
+                buf = bytearray()
+                while len(buf) < image_length and self._running:
+                    chunk = sock.recv(image_length - len(buf))
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                if len(buf) != image_length:
+                    continue
+                with self._back_frame_lock:
+                    self._latest_back_frame = bytes(buf)
+                if self._show_overlay:
+                    try:
+                        self._render_back_overlay(bytes(buf), cv2)
+                    except Exception:
+                        pass
+            except OSError:
                 break
 
     def _mark_unhealthy(self) -> None:
@@ -777,6 +836,25 @@ class RealGameInterface(GameInterface):
         # Re-pin TOPMOST in case the user clicked Unity and stole focus.
         # Cheap call (single Win32 SetWindowPos) so we do it every frame.
         self._pin_topmost_win32()
+
+    def _render_back_overlay(self, jpeg_bytes: bytes, cv2) -> None:
+        """Show the back camera as a live window so it does not vanish."""
+        import numpy as np  # type: ignore
+
+        np_arr = np.frombuffer(jpeg_bytes, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return
+        if not self._back_overlay_window_ready:
+            try:
+                cv2.namedWindow(self._back_overlay_window, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(self._back_overlay_window, 640, 360)
+                cv2.moveWindow(self._back_overlay_window, 760, 20)
+            except Exception:
+                pass
+            self._back_overlay_window_ready = True
+        cv2.imshow(self._back_overlay_window, frame)
+        cv2.waitKey(1)
 
     def _init_overlay_window(self, cv2) -> None:
         """One-time setup: create the window and try to pin always-on-top.

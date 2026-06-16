@@ -142,6 +142,7 @@ LOG_FLUSH_EVERY = 50           # flush CSV every N rows to bound IO overhead
 # ----------------------------------------------------------------------
 GAME_CAMERA_HOST = "127.0.0.1"
 GAME_FRONT_CAMERA_PORT = 8080
+GAME_BACK_CAMERA_PORT = 8082
 GAME_CONTROL_HOST = "127.0.0.1"
 GAME_CONTROL_PORT = 8081
 
