@@ -65,25 +65,53 @@ def nearest_safe_lane(current, red, n):
     return min(candidates, key=lambda i: abs(i - current))
 
 
+def lane_red_distance(i, red, n):
+    """Return the distance in lanes to the nearest red token lane."""
+    if not any(red.values()):
+        return n
+
+    distances = [abs(i - j) for j in range(n) if red[j]]
+    return min(distances) if distances else n
+
+
+def is_red_danger_zone(i, red, n):
+    """Hard block lanes that are red or directly adjacent to red."""
+    if red[i]:
+        return True
+    if i > 0 and red[i - 1]:
+        return True
+    if i < n - 1 and red[i + 1]:
+        return True
+    return False
+
+
 # =========================
-# LOCAL GREEN ONLY (NO CHASE)
+# GREEN-FIRST TARGETING
 # =========================
-def local_green_score(tokens, lane_centers, frame_h, current_lane, n):
-    score = {i: 0 for i in range(n)}
+def lane_token_score(tokens, lane_centers, frame_h, color, current_lane=None):
+    score = {i: 0.0 for i in range(len(lane_centers))}
 
     for t in tokens:
-        if t['color'] != 'green':
+        if t['color'] != color:
             continue
 
         li = lane_of(t['x'], lane_centers)
-        dist = frame_h - t['y']
+        dist = max(frame_h - t['y'], 20)
+        proximity = 1.0 / dist
 
-        # ONLY local influence (prevents chasing far green)
-        if abs(li - current_lane) <= 1:
-            score[li] += 1.0 / max(dist, 20)
+        # Prefer tokens that are lower on screen and closer to our current lane.
+        lateral_bias = 1.0
+        if current_lane is not None:
+            lateral_bias = 1.0 / (1.0 + abs(li - current_lane) * 0.65)
 
-    best_lane = max(score, key=score.get)
-    return best_lane if score[best_lane] > 0.02 else -1
+        if color == 'green':
+            score[li] += proximity * 5.0 * lateral_bias
+        elif color == 'yellow':
+            score[li] += proximity * 1.6 * lateral_bias
+        elif color == 'red':
+            score[li] += proximity * 0.15 * lateral_bias
+
+    return score
 
 
 # =========================
@@ -92,16 +120,14 @@ def local_green_score(tokens, lane_centers, frame_h, current_lane, n):
 def lane_risk_score(i, red, yellow, n):
 
     # HARD BLOCK
-    if red[i]:
+    if is_red_danger_zone(i, red, n):
         return 1e9
 
     risk = 0
 
     # local danger
-    if i > 0 and red[i - 1]:
-        risk += 500
-    if i < n - 1 and red[i + 1]:
-        risk += 500
+    red_dist = lane_red_distance(i, red, n)
+    risk += max(0, 4 - red_dist) * 250
 
     # trap pattern detection (RRV / RRVVV)
     if i > 0 and i < n - 1:
@@ -154,6 +180,9 @@ def decide(tokens, lane_centers, current_lane, frame_h):
         elif t['color'] == "yellow":
             yellow[i] = True
 
+    green_scores = lane_token_score(forward, lane_centers, frame_h, 'green', current_lane)
+    yellow_scores = lane_token_score(forward, lane_centers, frame_h, 'yellow', current_lane)
+
     # =========================
     # EMERGENCY (NO DISCUSSION)
     # =========================
@@ -168,21 +197,59 @@ def decide(tokens, lane_centers, current_lane, frame_h):
         return escape, "TRAP_ESCAPE"
 
     # =========================
-    # GLOBAL SAFE SEARCH (IMPORTANT FIX)
+    # GREEN FIRST
+    # =========================
+    best_green_lane = -1
+    best_green_score = 0.0
+    for i in range(n):
+        if is_red_danger_zone(i, red, n):
+            continue
+        score = green_scores[i]
+        score += lane_red_distance(i, red, n) * 0.25
+        if score > best_green_score:
+            best_green_score = score
+            best_green_lane = i
+
+    if best_green_lane != -1 and best_green_score >= 0.012:
+        return best_green_lane, f"CHASE_GREEN_{best_green_lane}"
+
+    # =========================
+    # YELLOW SECOND
+    # =========================
+    best_yellow_lane = -1
+    best_yellow_score = 0.0
+    for i in range(n):
+        if is_red_danger_zone(i, red, n):
+            continue
+        score = yellow_scores[i]
+        score += lane_red_distance(i, red, n) * 0.15
+        if score > best_yellow_score:
+            best_yellow_score = score
+            best_yellow_lane = i
+
+    if best_yellow_lane != -1 and best_yellow_score >= 0.011:
+        # Only take yellow if there is no strong green option.
+        return best_yellow_lane, f"CHASE_YELLOW_{best_yellow_lane}"
+
+    # =========================
+    # FALLBACK SAFE SEARCH
     # =========================
     best_lane = current_lane
     best_score = -1e9
 
     for i in range(n):
-
         risk = lane_risk_score(i, red, yellow, n)
-        if risk > 800:
+        if risk > 0:
             continue  # avoid dangerous lanes
 
         corridor = safe_corridor_score(i, red, yellow, n)
 
         score = 0
         score += corridor * 120
+        score += lane_red_distance(i, red, n) * 140
+
+        # If we already saw some green elsewhere, gently bias toward it.
+        score += green_scores[i] * 900
 
         # stability (avoid zigzag)
         score -= abs(i - current_lane) * 35
@@ -192,7 +259,10 @@ def decide(tokens, lane_centers, current_lane, frame_h):
 
         # yellow penalty
         if yellow[i]:
-            score -= 150
+            score -= 260
+
+        # stay far from any red cluster even when falling back
+        score += lane_red_distance(i, red, n) * 60
 
         if score > best_score:
             best_score = score
@@ -266,17 +336,22 @@ def driving_logic_task():
     target, reason = decide(tokens, lane_centers, current_lane, h)
 
     # =========================
-    # FAST LANE LOCK (NO LAG)
+    # FAST LANE LOCK (GREEN CAN PREEMPT)
     # =========================
     if _lane_lock == -1:
         _lane_lock = target
-
     elif target == _lane_lock:
         _lock_counter = 0
-
+    elif target >= 0 and (
+        "CHASE_GREEN" in reason
+        or "EMERGENCY_RED" in reason
+        or "TRAP_ESCAPE" in reason
+    ):
+        _lane_lock = target
+        _lock_counter = 0
     else:
         _lock_counter += 1
-        if _lock_counter > 2:  # FAST reaction
+        if _lock_counter > 1:  # faster reaction, less stickiness
             _lane_lock = target
             _lock_counter = 0
 

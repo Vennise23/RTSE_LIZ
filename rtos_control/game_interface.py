@@ -27,6 +27,7 @@ import struct
 import sys
 import threading
 import time
+import statistics
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -382,6 +383,12 @@ class RealGameInterface(GameInterface):
         self._overlay_window = "RTOS Perception (RTSE)"
         self._overlay_window_ready = False
 
+        # Brightness smoothing so brief yellow-flash / visual effects do
+        # not get misclassified as a real low-light event.
+        self._brightness_history = []
+        self._smoothed_brightness_history = []
+        self._low_brightness_started_at = None
+
     # ---- lifecycle ------------------------------------------------
     def start(self) -> None:
         self._running = True
@@ -536,6 +543,34 @@ class RealGameInterface(GameInterface):
             )
         self._last_command_at = now
 
+        # Median filter: ignore single-frame dips caused by token flash
+        # effects or transient exposure changes.
+        self._brightness_history.append(float(brightness))
+        if len(self._brightness_history) > 5:
+            self._brightness_history.pop(0)
+        filtered_brightness = float(statistics.median(self._brightness_history)) if self._brightness_history else float(brightness)
+
+        self._smoothed_brightness_history.append(filtered_brightness)
+        if len(self._smoothed_brightness_history) > 4:
+            self._smoothed_brightness_history.pop(0)
+
+        # Only treat it as low light when the smoothed brightness is
+        # below the threshold and is still trending downward.
+        low_light_trending_down = False
+        if len(self._smoothed_brightness_history) >= 3:
+            a, b, c = self._smoothed_brightness_history[-3:]
+            low_light_trending_down = a > b > c
+        if filtered_brightness < config.LOW_LIGHT_THRESHOLD and low_light_trending_down:
+            if self._low_brightness_started_at is None:
+                self._low_brightness_started_at = now
+        else:
+            self._low_brightness_started_at = None
+
+        low_light_detected = (
+            self._low_brightness_started_at is not None
+            and (now - self._low_brightness_started_at) >= config.LOW_LIGHT_CONFIRM_SEC
+        )
+
         with self._perception_lock:
             self._latest_state = GameState(
                 timestamp=now,
@@ -544,8 +579,8 @@ class RealGameInterface(GameInterface):
                 # throttle as a proxy. Decision uses this only to widen
                 # look-ahead, so the proxy is good enough.
                 speed_norm=max(0.0, min(1.0, self._last_acceleration)),
-                brightness=brightness,
-                low_light_active=brightness < config.LOW_LIGHT_THRESHOLD,
+                brightness=filtered_brightness,
+                low_light_active=low_light_detected,
                 rear_pressure=0.0,
                 rear_chase_active=False,
                 rear_chase_lane=-1,
@@ -806,7 +841,7 @@ class RealGameInterface(GameInterface):
     def _status_label(self) -> str:
         """Add a compact status tag for challenge states."""
         snap = self.read_state()
-        if getattr(snap, "brightness", 1.0) < config.LOW_LIGHT_THRESHOLD:
+        if getattr(snap, "low_light_active", False):
             return "LOW_LIGHT"
         return "NORMAL"
 

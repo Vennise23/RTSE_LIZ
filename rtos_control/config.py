@@ -51,32 +51,31 @@ LOOKAHEAD_SPEED_GAIN = 0.40    # extra look-ahead per unit of normalized speed
 SWITCH_COOLDOWN = 0.15
 
 # Minimum reward advantage required to justify a discretionary lane change.
-# Acts as hysteresis around the chosen lane. With reds/yellows weighted
-# 20x the green reward, even tiny differences in red exposure dominate
-# this threshold, so we can keep it small.
-SWITCH_MARGIN = 0.15
+# Slightly relaxed so clean green lanes win more often.
+SWITCH_MARGIN = 0.16
 
 # Reward / penalty weights.
 #   Red:    must dominate everything — 20x green reward. Triggers the
 #           SAFETY branch (emergency lane change) the moment it appears
 #           within BRAKE_DIST in the current lane.
-#   Yellow: undesirable but NOT worth losing a green for. Weight 2x
-#           green reward, and it does NOT trigger the SAFETY branch on
-#           its own. A lane with only-yellow is avoided; a lane with
-#           green-then-yellow is still preferred over an empty one.
+#   Yellow: undesirable and usually not worth a lane change. It should
+#           be collected only when the lane is otherwise clean and the
+#           green benefit is clear.
 #   Green:  the only positive contributor.
 GREEN_REWARD   = 1.0
-RED_PENALTY    = 20.0
-YELLOW_PENALTY = 2.0
+RED_PENALTY    = 28.0
+YELLOW_PENALTY = 4.0
 
 # ----------------------------------------------------------------------
 # Challenge 1: low-light handling
 # ----------------------------------------------------------------------
 # When perceived brightness drops below this threshold, switch to the
 # recovery mode described in the challenge.
-LOW_LIGHT_THRESHOLD = 0.25
-# Require a little persistence so we do not flicker in and out on noise.
-LOW_LIGHT_CONFIRM_FRAMES = 3
+LOW_LIGHT_THRESHOLD = 0.12
+# Require more persistence so brief token flash effects do not trigger it.
+LOW_LIGHT_CONFIRM_FRAMES = 5
+# Also require the dip to persist for a short time in seconds.
+LOW_LIGHT_CONFIRM_SEC = 0.8
 # Mock-only: trigger the low-light event once in the opening 10 seconds.
 LOW_LIGHT_TRIGGER_SEC = 5.0
 # While the light is off, other control actions reduce speed by 10%.

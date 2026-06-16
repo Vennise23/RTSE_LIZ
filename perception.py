@@ -103,7 +103,7 @@ def read_back_camera_task():
 
 
 # ---------------------------------------------------------
-# Token detection (UNCHANGED CORE LOGIC)
+# Token detection
 # ---------------------------------------------------------
 def detect_tokens(frame):
     detected_tokens = []
@@ -117,12 +117,14 @@ def detect_tokens(frame):
     roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
+    # Tighten green the most because we want to prioritize it and avoid
+    # mistaking grass/road highlights for collectible tokens.
     color_ranges = {
-        'green': [(np.array([40, 80, 80]), np.array([85, 255, 255]))],
-        'yellow': [(np.array([20, 80, 80]), np.array([35, 255, 255]))],
+        'green': [(np.array([38, 90, 75]), np.array([82, 255, 255]))],
+        'yellow': [(np.array([20, 80, 80]), np.array([38, 255, 255]))],
         'red': [
-            (np.array([0, 80, 80]), np.array([10, 255, 255])),
-            (np.array([170, 80, 80]), np.array([180, 255, 255]))
+            (np.array([0, 90, 70]), np.array([12, 255, 255])),
+            (np.array([168, 90, 70]), np.array([180, 255, 255]))
         ],
     }
 
@@ -137,18 +139,32 @@ def detect_tokens(frame):
 
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.GaussianBlur(mask, (5, 5), 0)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < 300 or area > 8000:
+            if area < 240 or area > 9000:
                 continue
 
             x, y, w, h = cv2.boundingRect(contour)
             aspect_ratio = w / float(h)
 
-            if aspect_ratio < 0.6 or aspect_ratio > 1.6:
+            if aspect_ratio < 0.55 or aspect_ratio > 1.9:
+                continue
+
+            # Token discs are roughly circular, so reject long/skinny blobs.
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter <= 0:
+                continue
+
+            circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+            if color == 'green' and circularity < 0.58:
+                continue
+            if color == 'yellow' and circularity < 0.50:
+                continue
+            if color == 'red' and circularity < 0.48:
                 continue
 
             x += roi_x1
