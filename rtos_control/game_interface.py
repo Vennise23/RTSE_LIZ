@@ -29,10 +29,36 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import config
 from .state import GameState, Obstacle, Token, TokenColor
+
+
+# ----------------------------------------------------------------------
+# Helper: Reliable TCP socket reading
+# ----------------------------------------------------------------------
+def recv_exact(sock: socket.socket, size: int) -> bytes:
+    """Receive exactly `size` bytes from socket or raise OSError if connection breaks.
+    
+    Args:
+        sock: The socket to read from.
+        size: Number of bytes to read.
+        
+    Returns:
+        Exactly `size` bytes of data.
+        
+    Raises:
+        OSError: If the connection closes before all bytes are received.
+    """
+    buf = bytearray()
+    while len(buf) < size:
+        chunk = sock.recv(size - len(buf))
+        if not chunk:
+            raise OSError(f"Connection closed after {len(buf)}/{size} bytes")
+        buf.extend(chunk)
+    return bytes(buf)
 
 
 # ----------------------------------------------------------------------
@@ -165,7 +191,11 @@ class MockGameInterface(GameInterface):
         if self._speed_norm < 0.05:
             self._speed_norm = 0.05  # never fully stop in mock so flow stays interesting
         if self._low_light_active:
-            self._speed_norm *= config.LOW_LIGHT_SPEED_PENALTY_FACTOR
+            if self._low_light_reverse:
+                # reverse effect = recovery / boost instead of penalty
+                self._speed_norm = min(1.0, self._speed_norm + 0.2 * dt)
+            else:
+                self._speed_norm *= config.LOW_LIGHT_SPEED_PENALTY_FACTOR
 
         if self._rear_chase_active and self._rear_chase_lane == self._own_lane and not self._chase_collision_done:
             self._speed_norm *= config.CHASE_CAR_SPEED_PENALTY_FACTOR
@@ -209,21 +239,25 @@ class MockGameInterface(GameInterface):
     def _update_low_light(self, now: float, dt: float) -> None:
         if self._run_started_at is None:
             self._run_started_at = now
+
         elapsed = now - self._run_started_at
-        if not self._low_light_active and elapsed >= config.LOW_LIGHT_TRIGGER_SEC:
-            self._low_light_active = True
-            self._low_light_started_at = now
-            self._low_light_applied = False
-            # All tokens become unknown while the light is off.
-            self._tokens = tuple(
-                Token(lane=t.lane, distance=t.distance, color=TokenColor.YELLOW)
-                for t in self._tokens
-            )
-        if self._low_light_active:
-            self._rear_pressure = max(self._rear_pressure, 0.2)
-            if self._acceleration <= -0.9:
+
+        # --- 1. ENTRY condition (more realistic range) ---
+        if not self._low_light_active:
+            if 0.20 <= self._last_brightness <= 0.45:
+                self._low_light_active = True
+                self._low_light_started_at = now
+                self._low_light_reverse = True
+
+        # --- 2. EXIT condition (hysteresis) ---
+        else:
+            if self._last_brightness > 0.60:
                 self._low_light_active = False
-                self._low_light_applied = True
+                self._low_light_reverse = False
+
+        # --- 3. optional decay effect (keep your behavior) ---
+        if self._low_light_active:
+            self._rear_pressure = max(0.0, self._rear_pressure - 0.2)
 
     def _update_police_state(self, now: float, dt: float) -> None:
         if self._run_started_at is None:
@@ -349,6 +383,7 @@ class RealGameInterface(GameInterface):
     def __init__(self, show_overlay: bool = True) -> None:
         # Networking
         self._front_sock: Optional[socket.socket] = None
+        self._back_sock: Optional[socket.socket] = None
         self._control_server: Optional[socket.socket] = None
         self._control_conn: Optional[socket.socket] = None
         self._setup_thread: Optional[threading.Thread] = None
@@ -363,6 +398,34 @@ class RealGameInterface(GameInterface):
         # game produces frames. ``read_state`` then returns a cached
         # snapshot in O(1).
         self._reader_thread: Optional[threading.Thread] = None
+        self._back_reader_thread: Optional[threading.Thread] = None
+        self._perception_thread: Optional[threading.Thread] = None
+        self._vehicle_thread: Optional[threading.Thread] = None
+        self._overlay_thread: Optional[threading.Thread] = None
+
+        self._front_frame_lock = threading.Lock()
+        self._front_frame: Optional[Any] = None
+        self._front_frame_ts: float = 0.0
+        self._back_frame_lock = threading.Lock()
+        self._back_frame: Optional[Any] = None
+        self._back_frame_ts: float = 0.0
+
+        self._detection_lock = threading.Lock()
+        self._last_enriched: List[Tuple[Token, Tuple[int, int, int, int]]] = []
+        self._last_chasing_car: Dict[str, Any] = {
+            "detected": False,
+            "score": 0.0,
+            "lane": -1,
+            "bbox": None,
+        }
+        self._last_police_car: Dict[str, Any] = {
+            "detected": False,
+            "score": 0.0,
+            "lane": -1,
+            "bbox": None,
+        }
+        self._last_brightness = 1.0
+        self._last_vehicle_detection_at = 0.0
 
         # Lane-of-self tracking (we never get told, so we integrate from
         # our own steering commands). 0 .. NUM_LANES-1.
@@ -370,6 +433,15 @@ class RealGameInterface(GameInterface):
         self._last_command_at: Optional[float] = None
         self._last_steering = 0.0
         self._last_acceleration = 0.0
+        
+        # ---------------- Visual Effects ----------------
+        self._yellow_effect_active = False
+        self._yellow_effect_start = 0.0
+        self._yellow_effect_duration = 2.5  # seconds
+        self._yellow_flash_state = False
+        self._yellow_last_toggle = 0.0
+
+        self._low_light_reverse = False  # "reverse mode"
 
         # Optional debug visualization. When on, the camera reader thread
         # draws an annotated frame in an OpenCV window. Off-by-default for
@@ -380,33 +452,235 @@ class RealGameInterface(GameInterface):
         # draw the HUD inside it).
         self._show_overlay = show_overlay
         self._overlay_window = "RTOS Perception (RTSE)"
+        self._overlay_back_window = "RTOS Perception (RTSE) - Rear"
         self._overlay_window_ready = False
+        self._overlay_back_ready = False
 
+        # Template images for vehicle detection (lazy-loaded by _load_templates).
+        self._chasing_templates: Optional[List] = None
+        self._police_templates: Optional[List] = None
+        self._templates_loaded = False
+
+        self._diagnostic_lock = threading.Lock()
+        self._diagnostics: Dict[str, int] = {
+            "front_frames": 0,
+            "back_frames": 0,
+            "decode_failures": 0,
+            "socket_errors": 0,
+            "perception_cycles": 0,
+            "overlay_frames": 0,
+            "token_detections": 0,
+            "vehicle_detections": 0,
+        }
+        self._performance_metrics: Dict[str, float] = {
+            "token_latency_ns": 0.0,
+            "token_count": 0.0,
+            "vehicle_latency_ns": 0.0,
+            "vehicle_count": 0.0,
+            "perception_latency_ns": 0.0,
+            "perception_count": 0.0,
+            "overlay_latency_ns": 0.0,
+            "overlay_count": 0.0,
+        }
+
+    def _load_templates(self) -> None:
+        """Lazy-load template images on first use (when cv2 is available)."""
+        if self._templates_loaded:
+            return
+        try:
+            import cv2  # type: ignore
+            asset_dir = Path(__file__).parent / "assets"
+            chasing_raw = [
+                cv2.imread(str(asset_dir / "chasing_car_front.png")),
+                cv2.imread(str(asset_dir / "chasing_car_back.png")),
+            ]
+            police_raw = [
+                cv2.imread(str(asset_dir / "police_car_front.png")),
+                cv2.imread(str(asset_dir / "police_car_back.png")),
+            ]
+            self._chasing_templates = [
+                gray
+                for image in chasing_raw
+                if image is not None
+                for gray in self._build_template_pyramid(image, cv2)
+            ]
+            self._police_templates = [
+                gray
+                for image in police_raw
+                if image is not None
+                for gray in self._build_template_pyramid(image, cv2)
+            ]
+        except ImportError:
+            print("[RealGameInterface] OpenCV not available; template detection disabled.")
+            self._chasing_templates = []
+            self._police_templates = []
+        finally:
+            self._templates_loaded = True
+
+    def _build_template_pyramid(self, image: Any, cv2: Any) -> List[Any]:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        scales = getattr(config, "REAL_GAME_TEMPLATE_SCALES", (1.2, 1.0, 0.8))
+        pyramid: List[Any] = []
+        for scale in scales:
+            if scale == 1.0:
+                resized = gray
+            else:
+                resized = cv2.resize(
+                    gray,
+                    None,
+                    fx=scale,
+                    fy=scale,
+                    interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR,
+                )
+            if resized.shape[0] < 16 or resized.shape[1] < 16:
+                continue
+            pyramid.append(resized)
+        return pyramid
+
+    def _template_detect(
+        self,
+        gray_frame,
+        templates: List,
+        cv2,
+        threshold: float = 0.65,
+    ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
+        best_score = 0.0
+        best_bbox = None
+
+        for template in templates:
+            if template is None:
+                continue
+            if template.shape[0] > gray_frame.shape[0] or template.shape[1] > gray_frame.shape[1]:
+                continue
+
+            result = cv2.matchTemplate(gray_frame, template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+            if max_val > best_score:
+                best_score = max_val
+                best_bbox = (max_loc[0], max_loc[1], template.shape[1], template.shape[0])
+
+        return best_score >= threshold, best_score, best_bbox
+
+    def _detect_vehicle(
+        self,
+        frame,
+        templates: Optional[List],
+        cv2,
+        threshold: float = 0.70,
+    ) -> Dict[str, any]:
+        if not templates or all(t is None for t in templates):
+            return {"detected": False, "score": 0.0, "lane": -1, "bbox": None}
+
+        x1 = int(frame.shape[1] * config.REAL_GAME_REAR_VEHICLE_ROI_X_FRAC[0])
+        x2 = int(frame.shape[1] * config.REAL_GAME_REAR_VEHICLE_ROI_X_FRAC[1])
+        y1 = int(frame.shape[0] * config.REAL_GAME_REAR_VEHICLE_ROI_Y_FRAC[0])
+        y2 = int(frame.shape[0] * config.REAL_GAME_REAR_VEHICLE_ROI_Y_FRAC[1])
+        roi = frame[y1:y2, x1:x2]
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+        detected, score, bbox = self._template_detect(gray_roi, templates, cv2, threshold=threshold)
+        lane = -1
+        if detected and bbox is not None:
+            x, y, w, h = bbox
+            x_full = x + x1
+            y_full = y + y1
+            center_x = x_full + w // 2
+            lane_bounds = [int(frame.shape[1] * f) for f in config.LANE_X_BOUNDS_FRAC]
+            lane = self._lane_for_x(center_x, lane_bounds)
+            bbox = (x_full, y_full, w, h)
+
+        return {"detected": detected, "score": score, "lane": lane, "bbox": bbox}
+
+    def _detect_chasing_car(
+        self,
+        frame,
+        cv2
+    ) -> Dict[str, any]:
+        """Detect chase car in frame."""
+        self._load_templates()
+        return self._detect_vehicle(frame, self._chasing_templates, cv2, threshold=0.70)
+
+    def _detect_police_car(
+        self,
+        frame,
+        cv2
+    ) -> Dict[str, any]:
+        """Detect police car in frame."""
+        self._load_templates()
+        return self._detect_vehicle(frame, self._police_templates, cv2, threshold=0.70)
+    
     # ---- lifecycle ------------------------------------------------
     def start(self) -> None:
         self._running = True
         self._setup_thread = threading.Thread(
-            target=self._setup_network, name="RealGameSetup", daemon=True,
+            target=self._setup_network,
+            name="RealGameSetup",
+            daemon=True,
         )
         self._setup_thread.start()
+
         self._reader_thread = threading.Thread(
-            target=self._camera_reader_loop, name="FrontCameraReader", daemon=True,
+            target=lambda: self._camera_reader_loop("front"),
+            name="FrontCameraReader",
+            daemon=True,
         )
         self._reader_thread.start()
 
+        self._back_reader_thread = threading.Thread(
+            target=lambda: self._camera_reader_loop("back"),
+            name="BackCameraReader",
+            daemon=True,
+        )
+        self._back_reader_thread.start()
+
+        self._perception_thread = threading.Thread(
+            target=self._perception_loop,
+            name="RealGamePerception",
+            daemon=True,
+        )
+        self._perception_thread.start()
+
+        self._vehicle_thread = threading.Thread(
+            target=self._vehicle_detection_loop,
+            name="RealGameVehicleDetection",
+            daemon=True,
+        )
+        self._vehicle_thread.start()
+
+        if self._show_overlay:
+            self._overlay_thread = threading.Thread(
+                target=self._overlay_loop,
+                name="RealGameOverlay",
+                daemon=True,
+            )
+            self._overlay_thread.start()
+
     def stop(self) -> None:
         self._running = False
-        for sock in (self._front_sock, self._control_conn, self._control_server):
-            try:
-                if sock is not None:
+        for sock in (self._front_sock, self._back_sock, self._control_conn, self._control_server):
+            if sock is not None:
+                try:
                     sock.close()
-            except OSError:
-                pass
-        # Close overlay window if it was opened.
+                except OSError:
+                    pass
+
+        for thread in (
+            self._reader_thread,
+            self._back_reader_thread,
+            self._perception_thread,
+            self._vehicle_thread,
+            self._overlay_thread,
+            self._setup_thread,
+        ):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=0.2)
+
         if self._show_overlay:
             try:
                 import cv2  # type: ignore
                 cv2.destroyWindow(self._overlay_window)
+                if self._overlay_back_ready:
+                    cv2.destroyWindow(self._overlay_back_window)
                 cv2.waitKey(1)
             except Exception:
                 pass
@@ -426,83 +700,111 @@ class RealGameInterface(GameInterface):
             except OSError:
                 time.sleep(0.5)
 
-        # Control server
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((config.GAME_CONTROL_HOST, config.GAME_CONTROL_PORT))
-        srv.listen(1)
-        srv.settimeout(1.0)
-        self._control_server = srv
-        print(f"[RealGameInterface] Control server listening on "
-              f"{config.GAME_CONTROL_HOST}:{config.GAME_CONTROL_PORT}")
-        while self._running and self._control_conn is None:
+        # Back camera (optional)
+        while self._running and self._back_sock is None:
             try:
-                conn, addr = srv.accept()
-                self._control_conn = conn
-                print(f"[RealGameInterface] Control client connected from {addr}")
-            except socket.timeout:
-                continue
+                s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s2.settimeout(1.0)
+                s2.connect((config.GAME_CAMERA_HOST, config.GAME_BACK_CAMERA_PORT))
+                s2.settimeout(None)
+                self._back_sock = s2
+                print("[RealGameInterface] Back camera connected.")
             except OSError:
-                break
+                time.sleep(0.5)
 
-    def _camera_reader_loop(self) -> None:
+        # Control server
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((config.GAME_CONTROL_HOST, config.GAME_CONTROL_PORT))
+            srv.listen(1)
+            srv.settimeout(1.0)
+            self._control_server = srv
+            print(f"[RealGameInterface] Control server listening on "
+                  f"{config.GAME_CONTROL_HOST}:{config.GAME_CONTROL_PORT}")
+            while self._running and self._control_conn is None:
+                try:
+                    conn, addr = srv.accept()
+                    self._control_conn = conn
+                    print(f"[RealGameInterface] Control client connected from {addr}")
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+        except OSError:
+            self._mark_unhealthy()
+
+    def _camera_reader_loop(self, which: Optional[str] = None) -> None:
         """Drain JPEG frames as fast as the game produces them.
 
-        Each iteration decodes one frame, runs token detection, and
-        updates the cached GameState. Perception (periodic) just reads
-        the cache.
+        This thread is only responsible for decoding and publishing the
+        newest frame. Perception and overlay work run in separate threads
+        so expensive detections do not block frame acquisition.
         """
-        # Lazy imports so the mock path works without OpenCV.
         try:
             import cv2  # type: ignore
             import numpy as np  # type: ignore
         except ImportError:
-            print("[RealGameInterface] OpenCV/numpy not installed; "
-                  "perception will be degraded.")
+            print("[RealGameInterface] OpenCV/numpy not installed; perception will be degraded.")
             return
 
-        # Wait for the socket to come up.
-        while self._running and self._front_sock is None:
+        if which is None:
+            which = "front"
+            try:
+                tname = threading.current_thread().name.lower()
+                if "back" in tname:
+                    which = "back"
+            except Exception:
+                pass
+
+        sock_attr = "_front_sock" if which == "front" else "_back_sock"
+        while self._running and getattr(self, sock_attr) is None:
             time.sleep(0.05)
 
-        sock = self._front_sock
+        sock = getattr(self, sock_attr)
         while self._running and sock is not None:
             try:
-                length_bytes = sock.recv(4)
-                if not length_bytes or len(length_bytes) < 4:
-                    self._mark_unhealthy()
-                    break
+                length_bytes = recv_exact(sock, 4)
                 image_length = int.from_bytes(length_bytes, "little")
-                buf = bytearray()
-                while len(buf) < image_length and self._running:
-                    chunk = sock.recv(image_length - len(buf))
-                    if not chunk:
-                        break
-                    buf.extend(chunk)
-                if len(buf) != image_length:
-                    self._mark_unhealthy()
-                    continue
-                np_arr = np.frombuffer(bytes(buf), np.uint8)
+                buf = recv_exact(sock, image_length)
+                np_arr = np.frombuffer(buf, np.uint8)
                 frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
                 if frame is None:
                     self._mark_unhealthy()
                     continue
-                brightness = self._estimate_brightness(frame, cv2, np)
-                enriched = self._detect_tokens(frame, cv2, np)
-                tokens = tuple(item[0] for item in enriched)
-                self._update_state_from_perception(frame.shape, brightness, tokens)
-                if self._show_overlay:
-                    try:
-                        self._render_overlay(frame, enriched, cv2)
-                    except Exception:
-                        # Never let a draw error kill the reader thread;
-                        # we'd rather lose the HUD than the perception.
-                        pass
+
+                max_width = getattr(config, "REAL_GAME_MAX_FRAME_WIDTH", 960)
+                if frame.shape[1] > max_width:
+                    scale = float(max_width) / frame.shape[1]
+                    frame = cv2.resize(
+                        frame,
+                        None,
+                        fx=scale,
+                        fy=scale,
+                        interpolation=cv2.INTER_AREA,
+                    )
+
+                now = time.perf_counter()
+                if which == "front":
+                    with self._front_frame_lock:
+                        self._front_frame = frame
+                        self._front_frame_ts = now
+                    with self._diagnostic_lock:
+                        self._diagnostics["front_frames"] += 1
+                else:
+                    with self._back_frame_lock:
+                        self._back_frame = frame
+                        self._back_frame_ts = now
+                    with self._diagnostic_lock:
+                        self._diagnostics["back_frames"] += 1
             except OSError:
+                with self._diagnostic_lock:
+                    self._diagnostics["socket_errors"] += 1
                 self._mark_unhealthy()
                 break
 
     def _mark_unhealthy(self) -> None:
+        """Mark perception as unhealthy when socket errors occur."""
         with self._perception_lock:
             self._latest_state = GameState(
                 timestamp=time.perf_counter(),
@@ -524,56 +826,203 @@ class RealGameInterface(GameInterface):
                 perception_healthy=False,
             )
 
-    def _update_state_from_perception(self, frame_shape, brightness, tokens) -> None:
-        # Integrate own lane from steering: +1 = right at LANE_HOLD_TIME pace.
-        now = time.perf_counter()
-        if self._last_command_at is not None:
-            dt = now - self._last_command_at
-            self._own_lane_float = max(
-                0.0,
-                min(float(config.NUM_LANES - 1),
-                    self._own_lane_float + self._last_steering * 2.5 * dt),
-            )
-        self._last_command_at = now
-
-        with self._perception_lock:
-            self._latest_state = GameState(
-                timestamp=now,
-                own_lane=int(round(self._own_lane_float)),
-                # We have no telemetry for actual speed; use the requested
-                # throttle as a proxy. Decision uses this only to widen
-                # look-ahead, so the proxy is good enough.
-                speed_norm=max(0.0, min(1.0, self._last_acceleration)),
-                brightness=brightness,
-                low_light_active=brightness < config.LOW_LIGHT_THRESHOLD,
-                rear_pressure=0.0,
-                rear_chase_active=False,
-                rear_chase_lane=-1,
-                rear_time_left=0.0,
-                police_alert=False,
-                police_lane=-1,
-                police_time_left=0.0,
-                game_over=False,
-                game_over_reason="",
-                tokens=tokens,
-                obstacles=(),  # Phase-1 token game has no obstacles per se
-                perception_healthy=True,
-            )
-
-    @staticmethod
-    def _estimate_brightness(frame, cv2, np) -> float:
-        """Estimate normalized brightness from the decoded front camera frame."""
+    def _estimate_brightness(self, frame, cv2, np) -> Tuple[float, bool]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return max(0.0, min(1.0, float(np.mean(gray)) / 255.0))
+        mean_brightness = float(np.mean(gray)) / 255.0
+
+        rows, cols = getattr(config, "LOW_LIGHT_GRID_SIZE", (5, 5))
+        region_means = []
+        h, w = gray.shape
+        for ry in range(rows):
+            y0 = int(h * ry / rows)
+            y1 = int(h * (ry + 1) / rows) if ry < rows - 1 else h
+            for cx in range(cols):
+                x0 = int(w * cx / cols)
+                x1 = int(w * (cx + 1) / cols) if cx < cols - 1 else w
+                region = gray[y0:y1, x0:x1]
+                region_means.append(float(np.mean(region)) / 255.0)
+
+        region_means_np = np.asarray(region_means, dtype=np.float32)
+        dark_ratio = float(np.count_nonzero(region_means_np < config.LOW_LIGHT_THRESHOLD)) / region_means_np.size
+        uniformity_std = float(np.std(region_means_np))
+        low_light_active = (
+            mean_brightness < config.LOW_LIGHT_THRESHOLD
+            and dark_ratio >= getattr(config, "LOW_LIGHT_DARK_RATIO", 0.85)
+            and uniformity_std < getattr(config, "LOW_LIGHT_UNIFORMITY_STD", 0.05)
+        )
+        return mean_brightness, low_light_active
+
+    def _perception_loop(self) -> None:
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+        except ImportError:
+            print("[RealGameInterface] OpenCV/numpy not installed; perception will be degraded.")
+            return
+
+        period = 1.0 / max(1.0, getattr(config, "REAL_GAME_TOKEN_DETECTION_HZ", 25.0))
+        while self._running:
+            start = time.perf_counter()
+            front_frame = self._get_latest_frame("front")
+            if front_frame is not None:
+                try:
+                    frame_start = time.perf_counter()
+                    brightness, low_light_active = self._estimate_brightness(front_frame, cv2, np)
+                    self._last_brightness = brightness
+                    enriched = self._detect_tokens(front_frame, cv2, np)
+                    now = time.perf_counter()
+
+                    # detect yellow tokens
+                    has_yellow = any(tok.color == TokenColor.YELLOW for tok, _ in enriched)
+
+                    # trigger flashing effect
+                    if has_yellow:
+                        self._yellow_effect_active = True
+                        self._yellow_effect_start = now
+                        self._yellow_last_toggle = now
+                    token_end = time.perf_counter()
+                    # expire yellow effect
+                    if self._yellow_effect_active:
+                        if now - self._yellow_effect_start > self._yellow_effect_duration:
+                            self._yellow_effect_active = False
+                        else:
+                            # toggle flash every 0.25s
+                            if now - self._yellow_last_toggle > 0.25:
+                                self._yellow_flash_state = not self._yellow_flash_state
+                                self._yellow_last_toggle = now
+                    with self._diagnostic_lock:
+                        self._diagnostics["token_detections"] += 1
+                        self._performance_metrics["token_latency_ns"] += (token_end - frame_start) * 1e9
+                        self._performance_metrics["token_count"] += 1
+
+                    with self._detection_lock:
+                        self._last_enriched = enriched
+                        self._last_brightness = brightness
+                        chasing_car = dict(self._last_chasing_car)
+                        police_car = dict(self._last_police_car)
+
+                    tokens = tuple(item[0] for item in enriched)
+                    self._update_state_from_perception(
+                        front_frame.shape,
+                        brightness,
+                        tokens,
+                        chasing_car,
+                        police_car,
+                        low_light_active=low_light_active,
+                    )
+                    perception_end = time.perf_counter()
+                    with self._diagnostic_lock:
+                        self._diagnostics["perception_cycles"] += 1
+                        self._performance_metrics["perception_latency_ns"] += (perception_end - start) * 1e9
+                        self._performance_metrics["perception_count"] += 1
+                except Exception:
+                    self._mark_unhealthy()
+
+            sleep_time = period - (time.perf_counter() - start)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    def _vehicle_detection_loop(self) -> None:
+        try:
+            import cv2  # type: ignore
+        except ImportError:
+            return
+
+        period = 1.0 / max(1.0, getattr(config, "REAL_GAME_VEHICLE_DETECTION_HZ", 4.0))
+        while self._running:
+            start = time.perf_counter()
+            front_frame = self._get_latest_frame("front")
+            if front_frame is not None:
+                try:
+                    vehicle_start = time.perf_counter()
+                    chasing_car = self._detect_chasing_car(front_frame, cv2)
+                    police_car = self._detect_police_car(front_frame, cv2)
+                    vehicle_end = time.perf_counter()
+                    with self._detection_lock:
+                        self._last_chasing_car = chasing_car
+                        self._last_police_car = police_car
+                        self._last_vehicle_detection_at = vehicle_end
+                    with self._diagnostic_lock:
+                        self._diagnostics["vehicle_detections"] += 1
+                        self._performance_metrics["vehicle_latency_ns"] += (vehicle_end - vehicle_start) * 1e9
+                        self._performance_metrics["vehicle_count"] += 1
+                except Exception:
+                    pass
+
+            sleep_time = period - (time.perf_counter() - start)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    def _overlay_loop(self) -> None:
+        try:
+            import cv2  # type: ignore
+        except ImportError:
+            return
+
+        period = 1.0 / max(1.0, config.REAL_GAME_OVERLAY_FPS)
+        while self._running:
+            start = time.perf_counter()
+            front_frame = self._get_latest_frame("front")
+            back_frame = self._get_latest_frame("back")
+            with self._detection_lock:
+                enriched = list(self._last_enriched)
+                chasing_car = dict(self._last_chasing_car)
+                police_car = dict(self._last_police_car)
+                cached_state = self.read_state()
+
+            if front_frame is not None:
+                try:
+                    overlay_start = time.perf_counter()
+                    self._render_overlay_front(
+                        front_frame,
+                        enriched,
+                        chasing_car,
+                        police_car,
+                        cv2,
+                        cached_state,
+                    )
+                    overlay_end = time.perf_counter()
+                    with self._diagnostic_lock:
+                        self._diagnostics["overlay_frames"] += 1
+                        self._performance_metrics["overlay_latency_ns"] += (overlay_end - overlay_start) * 1e9
+                        self._performance_metrics["overlay_count"] += 1
+                except Exception:
+                    pass
+
+            if back_frame is not None:
+                try:
+                    self._render_overlay_back(back_frame, chasing_car, police_car, cv2)
+                except Exception:
+                    pass
+
+            sleep_time = period - (time.perf_counter() - start)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    def _get_latest_frame(self, which: str) -> Optional[Any]:
+        if which == "front":
+            lock = self._front_frame_lock
+            frame = self._front_frame
+        else:
+            lock = self._back_frame_lock
+            frame = self._back_frame
+
+        with lock:
+            return frame.copy() if frame is not None else None
 
     @staticmethod
-    def _detect_tokens(frame, cv2, np) -> list:
+    def _detect_tokens(frame, cv2, np) -> List[Tuple]:
         """Lane-aware HSV token detector. Mirrors sample_drive.py but
         bins detections into lanes/distances normalized to [0, 1].
 
-        Returns an *enriched* list of ``(Token, (x, y, w, h))`` so the
-        overlay renderer can draw the original bounding boxes; the
-        caller converts to a plain ``tuple[Token, ...]`` for state.
+        Args:
+            frame: The video frame.
+            cv2: OpenCV module.
+            np: NumPy module.
+
+        Returns:
+            Enriched list of (Token, (x, y, w, h)) tuples so the
+            overlay renderer can draw the original bounding boxes.
         """
         h, w = frame.shape[:2]
         rx1 = int(w * config.ROI_X_FRAC[0])
@@ -626,10 +1075,112 @@ class RealGameInterface(GameInterface):
                 tok = Token(lane=lane, distance=dist_norm, color=color)
                 out.append((tok, (x_full, y_full, ww, hh)))
         return out
+    
+    def _draw_detection(
+        self,
+        frame,
+        detection: Dict[str, any],
+        label: str,
+        color: Tuple[int, int, int],
+        cv2,
+    ) -> None:
+        """Draw a labeled bounding box for a detection result.
+        
+        Args:
+            frame: The image to draw on (modified in-place).
+            detection: Detection result dict with 'detected', 'score', 'bbox'.
+            label: Text label to display.
+            color: BGR color tuple.
+            cv2: OpenCV module.
+        """
+        if not detection["detected"]:
+            return
+
+        bbox = detection["bbox"]
+
+        if bbox is None:
+            return
+
+        x, y, w, h = bbox
+
+        cv2.rectangle(
+            frame,
+            (x, y),
+            (x + w, y + h),
+            color,
+            3,
+        )
+
+        text = f"{label} ({detection['score']:.2f})"
+
+        cv2.putText(
+            frame,
+            text,
+            (x, max(20, y - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+    def _update_state_from_perception(
+        self,
+        frame_shape: Tuple[int, ...],
+        brightness: float,
+        tokens: Tuple[Token, ...],
+        chasing_car: Dict[str, any],
+        police_car: Dict[str, any],
+        low_light_active: bool,
+    ) -> None:
+        """Update cached GameState from perceived data.
+        
+        Args:
+            frame_shape: Shape of the frame (h, w, channels).
+            brightness: Normalized brightness [0, 1].
+            tokens: Tuple of detected tokens.
+            chasing_car: Chase car detection result.
+            police_car: Police car detection result.
+            low_light_active: Whether the frame is uniformly dark.
+        """
+        # Integrate own lane from steering: +1 = right at LANE_HOLD_TIME pace.
+        now = time.perf_counter()
+        if self._last_command_at is not None:
+            dt = now - self._last_command_at
+            self._own_lane_float = max(
+                0.0,
+                min(float(config.NUM_LANES - 1),
+                    self._own_lane_float + self._last_steering * 2.5 * dt),
+            )
+        self._last_command_at = now
+
+        with self._perception_lock:
+            self._latest_state = GameState(
+                timestamp=now,
+                own_lane=int(round(self._own_lane_float)),
+                # We have no telemetry for actual speed; use the requested
+                # throttle as a proxy. Decision uses this only to widen
+                # look-ahead, so the proxy is good enough.
+                speed_norm=max(0.0, min(1.0, self._last_acceleration)),
+                brightness=brightness,
+                    low_light_active=low_light_active,
+                game_over_reason="",
+                tokens=tokens,
+                obstacles=(),  # Phase-1 token game has no obstacles per se
+                perception_healthy=True,
+            )
 
     # ---- overlay --------------------------------------------------
-    def _render_overlay(self, frame, enriched, cv2) -> None:
-        """Draw an annotated copy of the frame in a live OpenCV window.
+    def _render_overlay_front(
+        self,
+        frame,
+        enriched: List[Tuple],
+        chasing_car: Dict[str, any],
+        police_car: Dict[str, any],
+        cv2,
+        cached_state: GameState,
+    ) -> None:
+        """Draw an annotated copy of the front camera frame in a live OpenCV window.
 
         Layers (bottom -> top):
           1. Lane dividers (vertical gray lines)
@@ -654,9 +1205,17 @@ class RealGameInterface(GameInterface):
         ry2 = int(h * config.ROI_Y_FRAC[1])
         lane_bounds = [int(w * f) for f in config.LANE_X_BOUNDS_FRAC]
         roi_height = max(1, ry2 - ry1)
-
+            
         out = frame.copy()
+        # ---------------- YELLOW FLASH EFFECT ----------------
+        if self._yellow_effect_active and self._yellow_flash_state:
+            h, w = out.shape[:2]
 
+            # left + right black panels
+            cv2.rectangle(out, (0, 0), (w // 5, h), (0, 0, 0), -1)
+            cv2.rectangle(out, (w - w // 5, 0), (w, h), (0, 0, 0), -1)
+        
+        
         # 1. Lane dividers
         for x in lane_bounds:
             cv2.line(out, (x, ry1), (x, ry2), (180, 180, 180), 1, cv2.LINE_AA)
@@ -723,15 +1282,14 @@ class RealGameInterface(GameInterface):
         # 6. Status bar (top)
         bar_h = 28
         cv2.rectangle(out, (0, 0), (w, bar_h), (28, 28, 28), -1)
-        snap = self.read_state()
-        brightness = getattr(snap, "brightness", 1.0)
+        brightness = getattr(cached_state, "brightness", 1.0)
         status = (f"R={counts[TokenColor.RED]} "
                   f"G={counts[TokenColor.GREEN]} "
                   f"Y={counts[TokenColor.YELLOW]}    "
                   f"B={brightness:.2f} "
                   f"TH={config.LOW_LIGHT_THRESHOLD:.2f}    "
                   f"ACT={self._actuation_label()}    "
-                  f"{self._status_label()}")
+                  f"{self._status_label(cached_state)}")
         cv2.putText(out, status, (10, 19),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 1, cv2.LINE_AA)
 
@@ -740,8 +1298,44 @@ class RealGameInterface(GameInterface):
         cv2.imshow(self._overlay_window, out)
         cv2.waitKey(1)
         # Re-pin TOPMOST in case the user clicked Unity and stole focus.
-        # Cheap call (single Win32 SetWindowPos) so we do it every frame.
         self._pin_topmost_win32()
+
+    def _render_overlay_back(
+        self,
+        frame,
+        chasing_car: Dict[str, any],
+        police_car: Dict[str, any],
+        cv2,
+    ) -> None:
+        """Draw rear view overlay with vehicle detection indicators.
+        
+        Args:
+            frame: The rear camera frame.
+            chasing_car: Detection result for chase car.
+            police_car: Detection result for police car.
+            cv2: OpenCV module.
+        """
+        out = frame.copy()
+        cv2.putText(
+            out, "REAR VIEW", (10, 25),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (240, 240, 240), 2, cv2.LINE_AA
+        )
+
+        self._draw_detection(out, chasing_car, "CHASE", (255, 0, 255), cv2)
+        self._draw_detection(out, police_car, "POLICE", (255, 255, 0), cv2)
+
+        if not getattr(self, '_overlay_back_ready', False):
+            try:
+                cv2.namedWindow(self._overlay_back_window, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(self._overlay_back_window, 480, 360)
+                cv2.moveWindow(self._overlay_back_window, 760, 20)
+            except Exception:
+                pass
+            self._overlay_back_ready = True
+
+        cv2.imshow(self._overlay_back_window, out)
+        cv2.waitKey(1)
+        self._pin_topmost_win32(self._overlay_back_window)
 
     def _init_overlay_window(self, cv2) -> None:
         """One-time setup: create the window and try to pin always-on-top.
@@ -767,14 +1361,17 @@ class RealGameInterface(GameInterface):
             pass
         self._overlay_window_ready = True
 
-    def _pin_topmost_win32(self) -> None:
+    def _pin_topmost_win32(self, window_name: Optional[str] = None) -> None:
         """Force the overlay to stay above all other windows (incl. Unity)."""
         if not sys.platform.startswith("win"):
             return
         try:
             import ctypes
             user32 = ctypes.windll.user32
-            hwnd = user32.FindWindowW(None, self._overlay_window)
+            # Allow pinning either the main overlay or a named window.
+            # If `window_name` is None, fall back to the main overlay.
+            target = window_name or self._overlay_window
+            hwnd = user32.FindWindowW(None, target)
             if not hwnd:
                 return
             HWND_TOPMOST = -1
@@ -803,15 +1400,27 @@ class RealGameInterface(GameInterface):
             parts.append("CRUISE")
         return "|".join(parts)
 
-    def _status_label(self) -> str:
-        """Add a compact status tag for challenge states."""
-        snap = self.read_state()
-        if getattr(snap, "brightness", 1.0) < config.LOW_LIGHT_THRESHOLD:
+    def _status_label(self, cached_state: GameState) -> str:
+        """Add a compact status tag for challenge states.
+        
+        Args:
+            cached_state: The cached GameState to check for conditions.
+        """
+        if getattr(cached_state, "brightness", 1.0) < config.LOW_LIGHT_THRESHOLD:
             return "LOW_LIGHT"
         return "NORMAL"
 
     @staticmethod
-    def _lane_for_x(x: int, lane_bounds) -> Optional[int]:
+    def _lane_for_x(x: int, lane_bounds: List[int]) -> Optional[int]:
+        """Determine the lane index for a given x-coordinate.
+        
+        Args:
+            x: The x-coordinate.
+            lane_bounds: List of lane boundary x-coordinates (NUM_LANES+1 elements).
+            
+        Returns:
+            Lane index or None if x is outside all lanes.
+        """
         # lane_bounds has NUM_LANES+1 elements (left and right edges of each lane)
         if x < lane_bounds[0] or x >= lane_bounds[-1]:
             return None
