@@ -19,7 +19,7 @@ import rtos
 from rtos import shared_data, data_lock
 
 
-SHOW_CAMERA = False
+SHOW_CAMERA = True
 
 
 # ---------------------------------------------------------
@@ -314,9 +314,44 @@ def processing_task():
                 (0, 255, 255)
 
         cv2.rectangle(debug, (x, y), (x + w, y + h), color, 2)
-        cv2.putText(debug, token['color'], (x, y - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        cv2.putText(
+            debug,
+            token['color'],
+            (x, y - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1
+        )
 
-    debug = cv2.resize(debug, (640, 480))
-    cv2.imshow("Perception", debug)
+    front_view = cv2.resize(debug, (640, 480))
+
+    if back_frame is not None:
+        back_view = cv2.resize(back_frame, (640, 480))
+    else:
+        back_view = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    combined = np.hstack((front_view, back_view))
+
+    cv2.putText(
+        combined,
+        "Front Camera",
+        (20, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 0),
+        2
+    )
+
+    cv2.putText(
+        combined,
+        "Back Camera",
+        (660, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 0),
+        2
+    )
+
+    cv2.imshow("RTSE Camera Monitor", combined)
     cv2.waitKey(1)

@@ -38,6 +38,7 @@ This lab introduces core principles of Real-Time Systems Engineering through a h
 - A faster car appears behind, and the player must switch lanes. On collision: −50% speed.
 - A police car appears behind, and the player must take the next red token. If you ignore: −50% speed.
 - The brightness decreases under 50%. All tokens become Yellow until the light is turned ON. While light ON, green tokens increase speed by +5% instead.
+- Challenge 2 - Chasing car: the rear car appears twice during the game. The first appearance gives 10 seconds to avoid it; the second gives 3 seconds. Collision with the chase car cuts speed by 50%.
 
 ---
 

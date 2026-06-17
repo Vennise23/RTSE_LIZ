@@ -65,13 +65,57 @@ SWITCH_MARGIN = 0.15
 #           its own. A lane with only-yellow is avoided; a lane with
 #           green-then-yellow is still preferred over an empty one.
 #   Green:  the only positive contributor.
-GREEN_REWARD   = 1.0
+GREEN_REWARD   = 3.0
 RED_PENALTY    = 20.0
-YELLOW_PENALTY = 2.0
+YELLOW_PENALTY = 18.0
 
+# ----------------------------------------------------------------------
+# Challenge 1: low-light handling
+# ----------------------------------------------------------------------
+# When perceived brightness drops below this threshold, switch to the
+# recovery mode described in the challenge.
+LOW_LIGHT_THRESHOLD = 0.25
+# Require a little persistence so we do not flicker in and out on noise.
+LOW_LIGHT_CONFIRM_FRAMES = 3
+# Grid size used to split the frame for spatial low-light analysis.
+LOW_LIGHT_GRID_SIZE = (5, 5)
+# Ratio of grid cells that must be dark for the scene to be considered
+# uniformly low-light.
+LOW_LIGHT_DARK_RATIO = 0.85
+# Maximum allowed standard deviation across region brightness values.
+LOW_LIGHT_UNIFORMITY_STD = 0.05
+# Mock-only: trigger the low-light event once in the opening 10 seconds.
+LOW_LIGHT_TRIGGER_SEC = 5.0
+# While the light is off, other control actions reduce speed by 10%.
+LOW_LIGHT_SPEED_PENALTY_FACTOR = 0.9
 # How strongly nearer tokens count vs far ones. The reward of a token is
 # weight * max(0, 1 - distance / LOOKAHEAD_eff).
 REWARD_DECAY_NEAR_BIAS = 1.0   # linear falloff; tune up for sharper preference for close tokens
+
+# ----------------------------------------------------------------------
+# Challenge 2: chasing car
+# ----------------------------------------------------------------------
+# The rear chase appears twice during a run in mock mode.
+CHASE_CAR_FIRST_APPEAR_SEC = 6.0
+CHASE_CAR_SECOND_APPEAR_SEC = 18.0
+# Time allowed to avoid the chase car after it appears.
+CHASE_CAR_FIRST_WINDOW_SEC = 10.0
+CHASE_CAR_SECOND_WINDOW_SEC = 3.0
+# Mock-only: lane windows to make the chase appear behind the player.
+CHASE_CAR_LANE_DRIFT_PER_SEC = 0.18
+# If the chase car "hits" the player, reduce speed to 50% immediately.
+CHASE_CAR_SPEED_PENALTY_FACTOR = 0.5
+# Mock-only geometry: how quickly the rear pressure rises once the event starts.
+CHASE_CAR_PRESSURE_RISE_PER_SEC = 0.18
+
+# ----------------------------------------------------------------------
+# Challenge 3: police car
+# ----------------------------------------------------------------------
+POLICE_CAR_MIN_APPEAR_SEC = 8.0
+POLICE_CAR_MAX_APPEAR_SEC = 28.0
+POLICE_CAR_WINDOW_SEC = 10.0
+POLICE_CAR_REQUIRED_TOKEN_COLOR = "red"
+POLICE_CAR_SPEED_PENALTY_FACTOR = 0.5
 
 # ----------------------------------------------------------------------
 # Actuation calibration (rule-based mapping from lane decision -> floats)
@@ -96,6 +140,8 @@ WATCHDOG_STALE_STATE_SEC = 0.15
 # ----------------------------------------------------------------------
 # Instrumentation
 # ----------------------------------------------------------------------
+ENABLE_CSV_LOGGING = False
+SHOW_END_SUMMARY = False
 LOG_DIR = "logs"
 LOG_FLUSH_EVERY = 50           # flush CSV every N rows to bound IO overhead
 
@@ -104,7 +150,8 @@ LOG_FLUSH_EVERY = 50           # flush CSV every N rows to bound IO overhead
 # ----------------------------------------------------------------------
 GAME_CAMERA_HOST = "127.0.0.1"
 GAME_FRONT_CAMERA_PORT = 8080
-GAME_BACK_CAMERA_PORT  = 8082
+# Optional back camera port (the Unity build can serve a rear view on this port)
+GAME_BACK_CAMERA_PORT = 8082
 GAME_CONTROL_HOST = "127.0.0.1"
 GAME_CONTROL_PORT = 8081
 
@@ -115,6 +162,15 @@ LANE_X_BOUNDS_FRAC = (0.15, 0.38, 0.62, 0.85)  # 4 edges -> 3 lanes
 # Vertical region of interest for token detection (fractions of frame height).
 ROI_Y_FRAC = (0.05, 0.70)
 ROI_X_FRAC = (0.15, 0.85)
+
+# Real-game token / vehicle / overlay tuning.
+REAL_GAME_TOKEN_DETECTION_HZ = 25.0
+REAL_GAME_VEHICLE_DETECTION_HZ = 4.0
+REAL_GAME_OVERLAY_FPS = 8.0
+REAL_GAME_TEMPLATE_SCALES = (1.2, 1.0, 0.8)
+REAL_GAME_MAX_FRAME_WIDTH = 960
+REAL_GAME_REAR_VEHICLE_ROI_X_FRAC = (0.15, 0.85)
+REAL_GAME_REAR_VEHICLE_ROI_Y_FRAC = (0.35, 0.95)
 
 # Mock-mode default duration (seconds). Real-mode runs until Ctrl+C.
 MOCK_RUN_SECONDS_DEFAULT = 20.0

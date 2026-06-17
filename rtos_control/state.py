@@ -28,9 +28,10 @@ class TokenColor(str, Enum):
 @dataclass(frozen=True)
 class Token:
     """A perception-side observation of a colored token on the road."""
-    lane: int           # 0 .. NUM_LANES-1
+    lane: int           # 0 .. NUM_LANES-1 (kept for compatibility)
     distance: float     # normalized [0, 1]; 0 = at the car, 1 = horizon
     color: TokenColor
+    x_pos: float = 0.5  # normalized horizontal position in [0, 1]
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class Obstacle:
     """A solid obstacle (other car, debris, etc.). Always treated as danger."""
     lane: int
     distance: float
+    x_pos: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,17 @@ class GameState:
     timestamp: float                 # perf_counter() at the moment of capture
     own_lane: int                    # which lane the car is currently in
     speed_norm: float                # normalized 0..1 (1 = top speed)
+    brightness: float = 1.0         # normalized 0..1, 1 = fully lit
+    low_light_active: bool = False   # challenge 1 active flag
+    rear_pressure: float = 0.0       # normalized 0..1, higher means the chase car is closer
+    rear_chase_active: bool = False  # challenge 2 active flag
+    rear_chase_lane: int = -1        # lane of the chasing car, -1 when inactive
+    rear_time_left: float = 0.0      # seconds left before the chase expires
+    police_alert: bool = False       # challenge 3 active flag
+    police_lane: int = -1           # lane of the police car, -1 when inactive
+    police_time_left: float = 0.0   # seconds left before the police challenge expires
+    game_over: bool = False          # set True when the police car collides with the player
+    game_over_reason: str = ""
     tokens: tuple = ()               # tuple[Token, ...]
     obstacles: tuple = ()            # tuple[Obstacle, ...]
     perception_healthy: bool = True  # set False if the underlying sensor failed
@@ -56,6 +69,17 @@ class GameState:
             timestamp=time.perf_counter(),
             own_lane=1,
             speed_norm=0.0,
+            brightness=1.0,
+            low_light_active=False,
+            rear_pressure=0.0,
+            rear_chase_active=False,
+            rear_chase_lane=-1,
+            rear_time_left=0.0,
+            police_alert=False,
+            police_lane=-1,
+            police_time_left=0.0,
+            game_over=False,
+            game_over_reason="",
             tokens=(),
             obstacles=(),
             perception_healthy=False,
@@ -71,6 +95,7 @@ class CommandKind(str, Enum):
     MOVE_RIGHT = "MOVE_RIGHT"
     SPEED_UP = "SPEED_UP"
     SLOW_DOWN = "SLOW_DOWN"
+    RECOVER_LIGHT = "RECOVER_LIGHT"
     DEGRADE = "DEGRADE"       # watchdog-issued: centre + slow down
 
 
