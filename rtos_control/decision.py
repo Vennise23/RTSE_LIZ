@@ -1,20 +1,11 @@
-"""Color-first decision policy.
+"""
+Decision policy (OVERRIDE + COST HYBRID)
 
-The function ``decide`` takes a perception snapshot (plus a small slice
-of decision-task memory) and returns a ``Command``. It is deliberately
-pure: no globals, no I/O, no random state. That is what makes it both
-unit-testable and time-predictable for response-time analysis.
-
-The policy is intentionally simple:
-
-    1. If a red token is directly ahead, move toward the safer side.
-    2. Otherwise prefer the side with visible green tokens.
-    3. Avoid yellow if we can, and never choose a side with a near red.
-    4. If nothing looks better, hold lane and cruise.
-
-This version does not try to reason in terms of lane 0/1/2 selection.
-It looks at the token colors and their horizontal placement relative to
-the car, which matches the "human-like" rule the user described.
+Priority order:
+1. LOW LIGHT (HARD OVERRIDE)
+2. POLICE EMERGENCY (HARD OVERRIDE)
+3. CHASE PRESSURE (HIGH PRIORITY)
+4. NORMAL COST-BASED DRIVING
 """
 
 from __future__ import annotations
@@ -24,182 +15,16 @@ from dataclasses import dataclass
 from typing import Optional
 
 from . import config
-from .state import Command, CommandKind, GameState, Token, TokenColor, Obstacle
+from .state import Command, CommandKind, GameState, TokenColor
 
 
 # ----------------------------------------------------------------------
-# Tunables for the color-first policy
+# COST WEIGHTS (only used in NORMAL mode)
 # ----------------------------------------------------------------------
-CENTER_BAND = 0.11
-SIDE_CLEAR_BAND = 0.04
-GREEN_GAIN = 1.0
-YELLOW_COST = 0.85
-RED_COST = 3.0
-# Favor green collection aggressively, but avoid lane-flapping.
-GREEN_CHASE_MIN = 0.10
-GREEN_SWITCH_COOLDOWN_SEC = 0.25
-
-
-def _effective_lookahead(speed_norm: float) -> float:
-    return config.LOOKAHEAD_BASE + config.LOOKAHEAD_SPEED_GAIN * max(0.0, min(1.0, speed_norm))
-
-
-def _own_x_pos(state: GameState) -> float:
-    """Normalize the car position to the same 0..1 scale as token x positions."""
-    if hasattr(state, "own_lane_pos"):
-        raw = float(getattr(state, "own_lane_pos"))
-    else:
-        raw = float(state.own_lane)
-    denom = max(1, config.NUM_LANES - 1)
-    if raw > 1.0:
-        raw = raw / denom
-    return max(0.0, min(1.0, raw))
-
-
-def _token_x_pos(tok: Token) -> float:
-    return max(0.0, min(1.0, float(getattr(tok, "x_pos", 0.5))))
-
-
-def _token_proximity(distance: float, lookahead: float) -> float:
-    return max(0.0, 1.0 - distance / lookahead)
-
-
-def _side_score(state: GameState, own_x: float, lookahead: float, side: str) -> float:
-    """Score colors on one side of the car using horizontal placement."""
-    score = 0.0
-    red_seen = False
-    for tok in state.tokens:
-        if tok.distance <= 0.0 or tok.distance > lookahead:
-            continue
-        dx = _token_x_pos(tok) - own_x
-        if side == "left" and dx >= 0.0:
-            continue
-        if side == "right" and dx <= 0.0:
-            continue
-        proximity = _token_proximity(tok.distance, lookahead)
-        lateral = max(0.0, 1.0 - min(1.0, abs(dx) / 0.5))
-
-        if tok.color is TokenColor.GREEN:
-            if red_seen:
-                continue
-            score += GREEN_GAIN * proximity * (0.7 + 0.3 * lateral)
-        elif tok.color is TokenColor.YELLOW:
-            score -= YELLOW_COST * proximity * (0.9 + 0.3 * lateral)
-        elif tok.color is TokenColor.RED:
-            red_seen = True
-            score -= RED_COST * proximity * (1.0 + 0.4 * lateral)
-
-    for obs in state.obstacles:
-        if obs.distance <= 0.0 or obs.distance > lookahead:
-            continue
-        dx = float(getattr(obs, "x_pos", own_x)) - own_x
-        if side == "left" and dx >= 0.0:
-            continue
-        if side == "right" and dx <= 0.0:
-            continue
-        proximity = _token_proximity(obs.distance, lookahead)
-        score -= RED_COST * proximity
-    return score
-
-
-def _side_green_score(state: GameState, own_x: float, lookahead: float, side: str) -> float:
-    """Positive-only version used to trigger more aggressive lane changes."""
-    score = 0.0
-    red_block = False
-    for tok in state.tokens:
-        if tok.color is not TokenColor.GREEN:
-            if tok.color is TokenColor.RED:
-                red_block = True
-            continue
-        if tok.distance <= 0.0 or tok.distance > lookahead:
-            continue
-        dx = _token_x_pos(tok) - own_x
-        if side == "left" and dx >= 0.0:
-            continue
-        if side == "right" and dx <= 0.0:
-            continue
-        if red_block:
-            continue
-        proximity = _token_proximity(tok.distance, lookahead)
-        lateral = max(0.0, 1.0 - min(1.0, abs(dx) / 0.5))
-        score += GREEN_GAIN * proximity * (0.8 + 0.2 * lateral)
-    return score
-
-
-def _front_red_ahead(state: GameState, own_x: float, brake_dist: float) -> bool:
-    for tok in state.tokens:
-        if tok.color is not TokenColor.RED:
-            continue
-        if tok.distance <= 0.0 or tok.distance > brake_dist:
-            continue
-        # Lane-based check is more stable than pure x-position matching.
-        if int(getattr(tok, "lane", -1)) == int(getattr(state, "own_lane", -1)):
-            return True
-    for obs in state.obstacles:
-        if obs.distance <= 0.0 or obs.distance > brake_dist:
-            continue
-        if int(getattr(obs, "lane", -1)) == int(getattr(state, "own_lane", -1)):
-            return True
-    return False
-
-
-def _front_red_best_side(state: GameState, own_x: float, brake_dist: float) -> Optional[str]:
-    """Pick the safer side when a red is directly ahead."""
-    left_blocked = _side_has_near_red(state, own_x, brake_dist, "left")
-    right_blocked = _side_has_near_red(state, own_x, brake_dist, "right")
-    if left_blocked and right_blocked:
-        return None
-    if not left_blocked and right_blocked:
-        return "left"
-    if left_blocked and not right_blocked:
-        return "right"
-
-    left_score = _side_score(state, own_x, brake_dist, "left")
-    right_score = _side_score(state, own_x, brake_dist, "right")
-    return "left" if left_score >= right_score else "right"
-
-
-def _front_red_debug(state: GameState, own_x: float, brake_dist: float) -> str:
-    """Compact debug string for front-red decisions."""
-    left_blocked = _side_has_near_red(state, own_x, brake_dist, "left")
-    right_blocked = _side_has_near_red(state, own_x, brake_dist, "right")
-    red_tokens = [
-        tok for tok in state.tokens
-        if tok.color is TokenColor.RED
-        and 0.0 < tok.distance <= brake_dist
-        and int(getattr(tok, "lane", -1)) == int(getattr(state, "own_lane", -1))
-    ]
-    red_count = len(red_tokens)
-    sample = "none"
-    if red_tokens:
-        tok = red_tokens[0]
-        sample = f"d={tok.distance:.2f} x={_token_x_pos(tok):.2f}"
-    return (
-        f"own_x={own_x:.2f} red_count={red_count} red={sample} "
-        f"left_blocked={int(left_blocked)} right_blocked={int(right_blocked)}"
-    )
-
-
-def _side_has_near_red(state: GameState, own_x: float, brake_dist: float, side: str) -> bool:
-    for tok in state.tokens:
-        if tok.color is not TokenColor.RED:
-            continue
-        if tok.distance <= 0.0 or tok.distance > brake_dist:
-            continue
-        dx = _token_x_pos(tok) - own_x
-        if side == "left" and dx < -SIDE_CLEAR_BAND:
-            return True
-        if side == "right" and dx > SIDE_CLEAR_BAND:
-            return True
-    for obs in state.obstacles:
-        if obs.distance <= 0.0 or obs.distance > brake_dist:
-            continue
-        dx = float(getattr(obs, "x_pos", own_x)) - own_x
-        if side == "left" and dx < -SIDE_CLEAR_BAND:
-            return True
-        if side == "right" and dx > SIDE_CLEAR_BAND:
-            return True
-    return False
+LANE_CHANGE_COST = 0.8
+STABILITY_LANE_COST = 0.3
+CENTER_LANE_BONUS = 0.1
+INVALID_ACTION_COST = 1e9
 
 
 def _side_has_any_bad_color(state: GameState, own_x: float, lookahead: float, side: str) -> bool:
@@ -234,17 +59,13 @@ def _side_is_clean_green_target(state: GameState, own_x: float, lookahead: float
 
 
 # ----------------------------------------------------------------------
-# Public decision entry point
+# MEMORY
 # ----------------------------------------------------------------------
 @dataclass
 class DecisionMemory:
     last_switch_time: float = -1e9
     last_command_kind: CommandKind = CommandKind.HOLD
     low_light_count: int = 0
-    low_light_active: bool = False
-    low_light_recovery_sent: bool = False
-    police_alert_seen: bool = False
-    game_over_seen: bool = False
 
 
 @dataclass
@@ -253,251 +74,231 @@ class DecisionResult:
     memory: DecisionMemory
 
 
+# ----------------------------------------------------------------------
+# HELPERS
+# ----------------------------------------------------------------------
+def _target_lane(action: CommandKind, lane: int) -> int:
+    if action == CommandKind.MOVE_LEFT:
+        return max(0, lane - 1)
+    if action == CommandKind.MOVE_RIGHT:
+        return min(config.NUM_LANES - 1, lane + 1)
+    return lane
+
+
+def _token_proximity(d: float, lookahead: float) -> float:
+    return max(0.0, 1.0 - d / lookahead)
+
+
+def _effective_lookahead(speed_norm: float) -> float:
+    return (
+        config.LOOKAHEAD_BASE
+        + config.LOOKAHEAD_SPEED_GAIN * max(0.0, min(1.0, speed_norm))
+    )
+
+
+# ----------------------------------------------------------------------
+# HARD SAFETY: POLICE
+# ----------------------------------------------------------------------
+def _imminent_police_collision(state: GameState, lane: int) -> bool:
+    if not getattr(state, "police_alert", False):
+        return False
+
+    pl = int(getattr(state, "police_lane", -1))
+    if pl < 0:
+        return False
+
+    t = float(getattr(state, "police_time_left", 999))
+    dist = abs(lane - pl)
+
+    return (t <= 2.5 and dist <= 2) or (t <= 1.5 and dist <= 3)
+
+
+# ----------------------------------------------------------------------
+# COST MODEL (NORMAL ONLY)
+# ----------------------------------------------------------------------
+def _color_cost(lane, red_min, green, yellow, lookahead):
+    cost = 0.0
+
+    if red_min[lane] <= lookahead:
+        cost += config.RED_PENALTY * _token_proximity(red_min[lane], lookahead)
+
+    for d in green[lane]:
+        if d <= lookahead:
+            cost -= config.GREEN_REWARD * _token_proximity(d, lookahead)
+
+    for d in yellow[lane]:
+        if d <= lookahead:
+            cost += config.YELLOW_PENALTY * 2.0 * _token_proximity(d, lookahead)
+
+    return cost
+
+
+def _stability_cost(target, current):
+    center = (config.NUM_LANES - 1) / 2
+    return (
+        abs(target - current) * STABILITY_LANE_COST
+        + abs(target - center) * CENTER_LANE_BONUS
+    )
+
+
+def _obstacle_cost(lane, obs, lookahead):
+    d = obs[lane]
+    if d <= 0:
+        return 0.0
+    if d <= lookahead:
+        return config.RED_PENALTY * (1.0 - d / lookahead)
+    return 0.0
+
+
+def _action_cost(action, own, red, green, yellow, obs, lookahead, state):
+    target = _target_lane(action, own)
+
+    if _imminent_police_collision(state, target):
+        return INVALID_ACTION_COST
+
+    cost = 0.0
+
+    if action in (CommandKind.MOVE_LEFT, CommandKind.MOVE_RIGHT):
+        cost += LANE_CHANGE_COST
+
+    cost += _color_cost(target, red, green, yellow, lookahead)
+    cost += _obstacle_cost(target, obs, lookahead)
+    cost += _stability_cost(target, own)
+
+    return cost
+
+
+# ----------------------------------------------------------------------
+# MAIN DECISION FUNCTION
+# ----------------------------------------------------------------------
 def decide(
     state: GameState,
     memory: DecisionMemory,
     now: Optional[float] = None,
 ) -> DecisionResult:
-    now = now if now is not None else time.perf_counter()
+
+    now = now or time.perf_counter()
+
     own = state.own_lane
     if own < 0:
-        cmd = Command(kind=CommandKind.HOLD, issued_at=now, reason="invalid_own_lane")
-        return DecisionResult(cmd, memory)
-
-    own_x = _own_x_pos(state)
-    lookahead = _effective_lookahead(state.speed_norm)
-    brake_dist = config.BRAKE_DIST
-    left_score = _side_score(state, own_x, lookahead, "left")
-    right_score = _side_score(state, own_x, lookahead, "right")
-    center_score = _side_score(state, own_x, lookahead, "center")
-    left_green = _green_target_score(state, own_x, lookahead, "left")
-    right_green = _green_target_score(state, own_x, lookahead, "right")
-    low_light_count = (
-        memory.low_light_count + 1
-        if state.brightness < config.LOW_LIGHT_THRESHOLD
-        else 0
-    )
-    low_light_active = low_light_count >= config.LOW_LIGHT_CONFIRM_FRAMES
-
-    if low_light_active:
-        memory = DecisionMemory(
-            last_switch_time=memory.last_switch_time,
-            last_command_kind=CommandKind.RECOVER_LIGHT,
-            low_light_count=low_light_count,
-            low_light_active=low_light_active,
-            low_light_recovery_sent=True,
-        )
-        cmd = Command(
-            kind=CommandKind.RECOVER_LIGHT,
-            issued_at=now,
-            reason="low_light_recovery",
-        )
-        return DecisionResult(cmd, memory)
+        return DecisionResult(Command(CommandKind.HOLD, now, "invalid_lane"), memory)
 
     if getattr(state, "game_over", False):
-        memory = DecisionMemory(
-            last_switch_time=memory.last_switch_time,
-            last_command_kind=CommandKind.HOLD,
-            low_light_count=low_light_count,
-            low_light_active=low_light_active,
-            low_light_recovery_sent=memory.low_light_recovery_sent,
-            police_alert_seen=getattr(state, "police_alert", False) or memory.police_alert_seen,
-            game_over_seen=True,
-        )
-        cmd = Command(
-            kind=CommandKind.HOLD,
-            issued_at=now,
-            reason=f"game_over:{getattr(state, 'game_over_reason', 'unknown')}",
-        )
-        return DecisionResult(cmd, memory)
+        return DecisionResult(Command(CommandKind.HOLD, now, "game_over"), memory)
 
-    # 0. Hard safety: if red is directly ahead, force an immediate lane change
-    # to the safer side before any green-chasing logic can run.
-    if _front_red_ahead(state, own_x, brake_dist):
-        best_side = _front_red_best_side(state, own_x, brake_dist)
-        debug = _front_red_debug(state, own_x, brake_dist)
-        if best_side is not None:
-            kind = CommandKind.MOVE_LEFT if best_side == "left" else CommandKind.MOVE_RIGHT
-            memory = DecisionMemory(
-                last_switch_time=now,
-                last_command_kind=kind,
-                low_light_count=low_light_count,
-                low_light_active=low_light_active,
-            )
-            cmd = Command(
-                kind=kind,
-                issued_at=now,
-                reason=f"hard_avoid_front_red_to_{best_side};{debug}",
-            )
-            return DecisionResult(cmd, memory)
+    # ============================================================
+    # 1. LOW LIGHT — HARD OVERRIDE (FIXED)
+    # ============================================================
+    low_light = (
+        getattr(state, "low_light_active", False)
+        or state.brightness == config.LOW_LIGHT_THRESHOLD
+    )
 
-        cmd = Command(
-            kind=CommandKind.SLOW_DOWN,
-            issued_at=now,
-            reason=f"front_red_no_clear_side;{_front_red_debug(state, own_x, brake_dist)}",
+    if low_light:
+        memory.low_light_count += 1
+
+        # FORCE ACTION: IGNORE ALL COSTS
+        return DecisionResult(
+            Command(
+                CommandKind.RECOVER_LIGHT,
+                now,
+                "LOW_LIGHT_OVERRIDE_ACCEL_-1.0"
+            ),
+            memory,
         )
-        return DecisionResult(cmd, memory)
 
+    # ============================================================
+    # 2. POLICE — HARD OVERRIDE
+    # ============================================================
     if getattr(state, "police_alert", False):
-        chase_lane = int(getattr(state, "rear_chase_lane", -1))
-        time_left = float(getattr(state, "rear_time_left", 0.0))
-        chase_reason = f"rear_chase_lane={chase_lane} time_left={time_left:.1f}"
-        memory = DecisionMemory(
-            last_switch_time=memory.last_switch_time,
-            last_command_kind=memory.last_command_kind,
-            low_light_count=low_light_count,
-            low_light_active=low_light_active,
-            low_light_recovery_sent=memory.low_light_recovery_sent,
-            police_alert_seen=True,
-            game_over_seen=False,
-        )
+        pl = getattr(state, "police_lane", -1)
 
-        left_safe = not _side_has_near_red(state, own_x, brake_dist, "left")
-        right_safe = not _side_has_near_red(state, own_x, brake_dist, "right")
-        if left_safe or right_safe:
-            if left_safe and right_safe:
-                best_side = "left" if left_score >= right_score else "right"
+        # force move away from police lane if possible
+        if pl >= 0:
+            if own <= pl:
+                action = CommandKind.MOVE_LEFT
             else:
-                best_side = "left" if left_safe else "right"
-            kind = CommandKind.MOVE_LEFT if best_side == "left" else CommandKind.MOVE_RIGHT
-            memory = DecisionMemory(
-                last_switch_time=now,
-                last_command_kind=kind,
-                low_light_count=low_light_count,
-                low_light_active=low_light_active,
+                action = CommandKind.MOVE_RIGHT
+
+            return DecisionResult(
+                Command(action, now, "POLICE_ESCAPE_OVERRIDE"),
+                memory,
             )
-            cmd = Command(
-                kind=kind,
-                issued_at=now,
-                reason=f"avoid_chasing_car_to_{best_side};{chase_reason}",
+
+    # ============================================================
+    # 3. CHASE PRESSURE — HIGH PRIORITY OVERRIDE
+    # ============================================================
+    if getattr(state, "rear_chase_active", False):
+        pressure = getattr(state, "rear_pressure", 0.0)
+
+        if pressure > 0.6:
+            # escape strategy: change lane aggressively
+            if own < config.NUM_LANES - 1:
+                action = CommandKind.MOVE_RIGHT
+            else:
+                action = CommandKind.MOVE_LEFT
+
+            return DecisionResult(
+                Command(action, now, "CHASE_ESCAPE"),
+                memory,
             )
-            return DecisionResult(cmd, memory)
 
-        memory = DecisionMemory(
-            last_switch_time=memory.last_switch_time,
-            last_command_kind=CommandKind.SLOW_DOWN,
-            low_light_count=low_light_count,
-            low_light_active=low_light_active,
+    # ============================================================
+    # 4. NORMAL COST POLICY
+    # ============================================================
+    lookahead = _effective_lookahead(state.speed_norm)
+
+    red, green, yellow, obs = _lane_metrics(state)
+
+    actions = [
+        CommandKind.HOLD,
+        CommandKind.MOVE_LEFT,
+        CommandKind.MOVE_RIGHT,
+        CommandKind.SLOW_DOWN,
+    ]
+
+    best_action = CommandKind.HOLD
+    best_cost = float("inf")
+
+    for a in actions:
+        target = _target_lane(a, own)
+
+        cost = _action_cost(
+            a, own, red, green, yellow, obs, lookahead, state
         )
-        cmd = Command(
-            kind=CommandKind.SLOW_DOWN,
-            issued_at=now,
-            reason=f"chasing_car_no_clear_side;{chase_reason}",
-        )
-        return DecisionResult(cmd, memory)
 
-    # 1. Safety: if a red is straight ahead, move to the safer side.
-    if _front_red_ahead(state, own_x, brake_dist):
-        candidates = []
-        if not _side_has_near_red(state, own_x, brake_dist, "left"):
-            candidates.append(("left", left_score, CommandKind.MOVE_LEFT))
-        if not _side_has_near_red(state, own_x, brake_dist, "right"):
-            candidates.append(("right", right_score, CommandKind.MOVE_RIGHT))
+        if cost < best_cost:
+            best_cost = cost
+            best_action = a
 
-        if candidates:
-            candidates.sort(key=lambda item: item[1], reverse=True)
-            side, score, kind = candidates[0]
-            if score > -RED_COST:
-                memory = DecisionMemory(
-                    last_switch_time=now,
-                    last_command_kind=kind,
-                    low_light_count=low_light_count,
-                    low_light_active=low_light_active,
-                )
-                cmd = Command(
-                    kind=kind,
-                    issued_at=now,
-                    reason=f"avoid_red_to_{side}_score={score:.2f}",
-                )
-                return DecisionResult(cmd, memory)
-
-        memory = DecisionMemory(
-            last_switch_time=memory.last_switch_time,
-            last_command_kind=CommandKind.SLOW_DOWN,
-            low_light_count=low_light_count,
-            low_light_active=low_light_active,
-        )
-        cmd = Command(
-            kind=CommandKind.SLOW_DOWN,
-            issued_at=now,
-            reason="front_red_no_clear_side",
-        )
-        return DecisionResult(cmd, memory)
-
-    if getattr(state, "low_light_active", False):
-        memory = DecisionMemory(
-            last_switch_time=memory.last_switch_time,
-            last_command_kind=CommandKind.RECOVER_LIGHT,
-            low_light_count=low_light_count,
-            low_light_active=low_light_active,
-            low_light_recovery_sent=True,
-            police_alert_seen=getattr(state, "police_alert", False),
-            game_over_seen=memory.game_over_seen,
-        )
-        cmd = Command(
-            kind=CommandKind.RECOVER_LIGHT,
-            issued_at=now,
-            reason="low_light_recovery",
-        )
-        return DecisionResult(cmd, memory)
-
-    # 2. Reward: if one side has a green target and it is safe, go there.
-    best_side = "left" if left_green >= right_green else "right"
-    best_green = max(left_green, right_green)
-    other_green = min(left_green, right_green)
-    side_score = left_score if best_side == "left" else right_score
-    green_edge = best_green - other_green
-    best_side_safe = _side_is_clean_green_target(state, own_x, lookahead, brake_dist, best_side)
-    green_recently_switched = (now - memory.last_switch_time) < GREEN_SWITCH_COOLDOWN_SEC
-
-    if best_green > 0.0 and best_side_safe:
-        if green_edge >= config.SWITCH_MARGIN or best_green >= GREEN_CHASE_MIN or not green_recently_switched:
-            kind = CommandKind.MOVE_LEFT if best_side == "left" else CommandKind.MOVE_RIGHT
-            memory = DecisionMemory(
-                last_switch_time=now,
-                last_command_kind=kind,
-                low_light_count=low_light_count,
-                low_light_active=low_light_active,
-            )
-            cmd = Command(
-                kind=kind,
-                issued_at=now,
-                reason=f"chase_green_to_{best_side}_green={best_green:.2f}",
-            )
-            return DecisionResult(cmd, memory)
-
-    # If both sides look dirty, do not force a green chase.
-    if _side_has_any_bad_color(state, own_x, lookahead, best_side):
-        best_side_safe = False
-
-    # 3. Stability: keep cruising unless the center is saturated with bad colors.
-    # Low-light is only observed/logged for now; it does not change actuation.
-    if center_score < -(config.GREEN_REWARD * 1.75):
-        memory = DecisionMemory(
-            last_switch_time=memory.last_switch_time,
-            last_command_kind=CommandKind.SLOW_DOWN,
-            low_light_count=low_light_count,
-            low_light_active=low_light_active,
-        )
-        cmd = Command(
-            kind=CommandKind.SLOW_DOWN,
-            issued_at=now,
-            reason="center_heavy_bad_colors",
-        )
-        return DecisionResult(cmd, memory)
-
-    memory = DecisionMemory(
-        last_switch_time=memory.last_switch_time,
-        last_command_kind=CommandKind.HOLD,
-        low_light_count=low_light_count,
-        low_light_active=low_light_active,
+    return DecisionResult(
+        Command(best_action, now, "COST_POLICY_V3"),
+        memory,
     )
-    cmd = Command(
-        kind=CommandKind.HOLD,
-        issued_at=now,
-        reason="cruise",
-    )
-    return DecisionResult(cmd, memory)
+
+
+# (reuse your existing lane metrics function if already defined elsewhere)
+def _lane_metrics(state: GameState):
+    n = config.NUM_LANES
+    red_min = [1.2] * n
+    green = [[] for _ in range(n)]
+    yellow = [[] for _ in range(n)]
+    obstacle_min = [1.2] * n
+
+    for t in state.tokens:
+        if 0 <= t.lane < n:
+            if t.color == TokenColor.RED:
+                red_min[t.lane] = min(red_min[t.lane], t.distance)
+            elif t.color == TokenColor.GREEN:
+                green[t.lane].append(t.distance)
+            elif t.color == TokenColor.YELLOW:
+                yellow[t.lane].append(t.distance)
+
+    for o in state.obstacles:
+        if 0 <= o.lane < n:
+            obstacle_min[o.lane] = min(obstacle_min[o.lane], o.distance)
+
+    return red_min, green, yellow, obstacle_min
 
 
 __all__ = ["decide", "DecisionMemory", "DecisionResult"]

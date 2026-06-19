@@ -1,0 +1,10 @@
+# Claude Code local settings — never commit
+.claude/
+
+# Runtime artifacts from rtos_control logging — regenerated every run
+logs/
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+*.pyo
