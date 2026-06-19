@@ -55,6 +55,12 @@ print("=" * 92)
 # 1. Plain green farming: greens ahead in lane 3 (reachable) -> switch right.
 run("1. tactical green (lane 3)", [tok('green', 3, 250), tok('green', 3, 200)])
 
+# 1b. Green two lanes away (lane 4) is still worth crossing for now.
+run("1b. green two lanes (lane 4)", [tok('green', 4, 230), tok('green', 4, 190)])
+
+# 1c. Empty road -> hold lane, no needless zig-zag.
+run("1c. empty road -> hold", [])
+
 # 2. Red dead ahead in our lane -> emergency escape, never sit on it.
 run("2. red in current lane", [tok('red', 2, 300)])
 

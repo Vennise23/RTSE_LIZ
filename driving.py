@@ -196,20 +196,31 @@ def decide(tokens, lane_centers, current_lane, frame_h, ev):
     # TACTICAL GREEN — score lanes: chase green, keep a wide safe corridor,
     # punish reds/yellows, prefer not to zig-zag, never touch the cop lane.
     # ---------------------------------------------------------------
+    # Net green is the win bottleneck, so this is tuned to COMMIT to green:
+    # green reward dominates, stability is a light anti-zigzag nudge, and a
+    # green two lanes away is still worth crossing for. Red lanes are excluded
+    # outright (never chase green into a red), so being aggressive stays safe.
     best_lane, best_score = current_lane, -1e9
     for i in range(n):
         if red[i]:
             continue
         score = 0.0
-        score += green_score[i] * 120.0           # PRIMARY: farm green (net +60)
-        score += safe_corridor_score(i, red, n) * 25.0
-        score -= abs(i - current_lane) * 30.0      # stability / anti-zigzag
+        score += green_score[i] * 170.0           # PRIMARY: farm green (net +60)
+        score += safe_corridor_score(i, red, n) * 18.0
+        score -= abs(i - current_lane) * 18.0      # light anti-zigzag only
         if yellow[i]:
-            score -= 120.0
+            score -= 110.0
         if i == cop_lane:
             score -= 1e6                            # hard-avoid the cop lane
         if score > best_score:
             best_score, best_lane = score, i
+    # Hold current lane unless another lane is clearly better — kills 1-tick
+    # flip-flop when two lanes score within a hair of each other.
+    cur_score = (green_score[current_lane] * 170.0
+                 + safe_corridor_score(current_lane, red, n) * 18.0) \
+        if not red[current_lane] else -1e9
+    if best_lane != current_lane and best_score - cur_score < 25.0:
+        return current_lane, "TACTICAL_HOLD"
     return best_lane, "TACTICAL_GREEN"
 
 
@@ -304,8 +315,10 @@ def driving_logic_task():
     elif target == _lane_lock:
         _lock_counter = 0
     else:
+        # decide() already applies a switch-margin against flip-flop, so the
+        # lock only needs a 1-tick confirm to commit quickly to a green.
         _lock_counter += 1
-        if _lock_counter > 2:
+        if _lock_counter > 1:
             _lane_lock = target
             _lock_counter = 0
 
