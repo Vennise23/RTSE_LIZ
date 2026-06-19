@@ -3,6 +3,26 @@
 Priority on game day: **Tactical win > distance at 180s**.
 Tactical win = net **+60 green** (green − red) **AND** pass every event ≥ once.
 
+## STRATEGY — read this first (decision from measured games)
+The **+60 net green is not realistically reachable** with vision-based lane
+selection. Across multiple tuned full games the net green stalls at **+1 to +5**
+(e.g. green 20 / red 19, green 29 / red 24): greens and reds are densely
+intermixed and get collected at near-parity no matter how aggressively we farm
+or avoid. So the **Tactical win is very unlikely**, and the real competition is
+**distance at 180 s** (the tiebreaker).
+
+Good news: optimising for distance and avoiding red are the SAME thing — a red
+is **−20% speed** and a green only **+10%**, so dodging one red is worth two
+greens *in speed terms*. Measured live: a game with ~29 reds collected tanked
+the speed multiplier to **0.40x**, which is what kills distance. So **reducing
+red collection is the single objective that helps everything** — net green AND
+distance. The build therefore prioritises red-avoidance and keeps throttle high.
+
+Events: in a measured game **all of EV1–EV5 passed from normal play** (5/5),
+so the event requirement is not the blocker — net green is. Don't burn time
+chasing +60. The highest-value future work is better RED DETECTION (we still
+collect reds we never saw); every red avoided is +20% speed kept.
+
 ## How to run
 1. Launch the V3.0 game: `RTSE_Phase_1_V3.0\SpeedTrials2D.exe`
 2. **Click the game window and press a key (Space/Enter) to start it** — it sits

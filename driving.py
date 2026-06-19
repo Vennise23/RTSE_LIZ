@@ -252,16 +252,18 @@ def control(target_lane, lane_centers, frame_w, rear_close):
     steering = (target_x - car_x) / (frame_w / 2)
     steering = float(np.clip(steering * 0.75, -1, 1))
 
+    # Distance is the real objective (the +60 tactical win is out of reach), so
+    # keep throttle as high as steering safety allows: full throttle on
+    # straights, a gentler slow-down through turns, and a faster recovery so we
+    # regain speed quickly after each correction.
     turn = abs(steering)
-    desired = 0.95
-    desired -= 0.5 * turn
-    if turn < 0.12:
-        desired += 0.03
+    desired = 1.0
+    desired -= 0.35 * turn                      # was 0.5 — lose less speed steering
     if rear_close:
         desired += 0.10
 
-    _speed_mem = _speed_mem * 0.80 + desired * 0.20
-    _speed_mem = float(np.clip(_speed_mem, 0.4, 1.0))
+    _speed_mem = _speed_mem * 0.65 + desired * 0.35   # was 0.80/0.20 — quicker recovery
+    _speed_mem = float(np.clip(_speed_mem, 0.5, 1.0))
     return steering, _speed_mem
 
 
