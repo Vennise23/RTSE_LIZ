@@ -173,11 +173,18 @@ ROI_X_FRAC = (0.15, 0.85)
 # Real-game token / vehicle / overlay tuning.
 REAL_GAME_TOKEN_DETECTION_HZ = 25.0
 REAL_GAME_VEHICLE_DETECTION_HZ = 4.0
+REAL_GAME_GOLDEN_OCR_HZ = 3.0
+REAL_GAME_GOLDEN_OCR_STALE_SEC = 1.5
 REAL_GAME_OVERLAY_FPS = 8.0
 REAL_GAME_TEMPLATE_SCALES = (1.2, 1.0, 0.8)
 REAL_GAME_MAX_FRAME_WIDTH = 960
 REAL_GAME_REAR_VEHICLE_ROI_X_FRAC = (0.15, 0.85)
 REAL_GAME_REAR_VEHICLE_ROI_Y_FRAC = (0.35, 0.95)
+
+# OCR crop for the exe golden-lane banner, expressed as fractions of the
+# window size. Tweak these if the banner position changes.
+REAL_GAME_GOLDEN_OCR_X_FRAC = (0.30, 0.82)
+REAL_GAME_GOLDEN_OCR_Y_FRAC = (0.03, 0.12)
 
 # Mock-mode default duration (seconds). Real-mode runs until Ctrl+C.
 MOCK_RUN_SECONDS_DEFAULT = 180.0

@@ -28,6 +28,9 @@ import sys
 import threading
 import time
 import statistics
+import re
+import os
+import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -468,6 +471,7 @@ class RealGameInterface(GameInterface):
         self._back_reader_thread: Optional[threading.Thread] = None
         self._perception_thread: Optional[threading.Thread] = None
         self._vehicle_thread: Optional[threading.Thread] = None
+        self._golden_ocr_thread: Optional[threading.Thread] = None
         self._overlay_thread: Optional[threading.Thread] = None
 
         self._front_frame_lock = threading.Lock()
@@ -493,6 +497,11 @@ class RealGameInterface(GameInterface):
         }
         self._last_brightness = 1.0
         self._last_vehicle_detection_at = 0.0
+        self._golden_lane_seen_at = 0.0
+        self._golden_banner_lane = -1
+        self._golden_banner_text = ""
+        self._golden_banner_time_left = 0.0
+        self._golden_ocr_status = ""
 
         # Lane-of-self tracking (we never get told, so we integrate from
         # our own steering commands). 0 .. NUM_LANES-1.
@@ -507,6 +516,7 @@ class RealGameInterface(GameInterface):
         self._yellow_effect_duration = 2.5  # seconds
         self._yellow_flash_state = False
         self._yellow_last_toggle = 0.0
+        self._golden_ocr_last_scan = 0.0
 
         self._low_light_reverse = False  # "reverse mode"
 
@@ -675,6 +685,87 @@ class RealGameInterface(GameInterface):
         """Detect police car in frame."""
         self._load_templates()
         return self._detect_vehicle(frame, self._police_templates, cv2, threshold=0.70)
+
+    def _detect_player_lane(
+        self,
+        frame,
+        cv2,
+    ) -> int:
+        """Estimate the player's lane from the road geometry.
+
+        Prefer a road-aware estimate: find the road span near the player's car,
+        split that span into five equal lanes, and map the car's x-position
+        into the resulting bands. If that fails, fall back to the old
+        center-line approximation and finally to steering integration.
+        """
+        h, w = frame.shape[:2]
+        lane_bounds = [int(w * f) for f in config.LANE_X_BOUNDS_FRAC]
+
+        try:
+            # Sample several scanlines above the player car. The road is
+            # dark gray while the grass is green, so a low-saturation mask
+            # is a decent proxy for the road span.
+            sample_ys = [int(h * f) for f in (0.70, 0.74, 0.78, 0.82)]
+            spans = []
+            for y in sample_ys:
+                row = frame[y]
+                # Road pixels are close to gray; grass/sky are more saturated.
+                row_u = row.astype("int16")
+                channel_spread = (
+                    abs(row_u[:, 0] - row_u[:, 1]) +
+                    abs(row_u[:, 1] - row_u[:, 2]) +
+                    abs(row_u[:, 0] - row_u[:, 2])
+                )
+                intensity = row_u.mean(axis=1)
+                road_mask = (channel_spread < 90) & (intensity > 45) & (intensity < 220)
+
+                idx = road_mask.nonzero()[0]
+                if len(idx) == 0:
+                    continue
+
+                # Keep the longest contiguous road segment on this scanline.
+                breaks = [0]
+                for i in range(1, len(idx)):
+                    if idx[i] != idx[i - 1] + 1:
+                        breaks.append(i)
+                breaks.append(len(idx))
+
+                best_span = None
+                best_len = 0
+                for a, b in zip(breaks[:-1], breaks[1:]):
+                    left = int(idx[a])
+                    right = int(idx[b - 1])
+                    span_len = right - left + 1
+                    if span_len > best_len:
+                        best_len = span_len
+                        best_span = (left, right)
+
+                if best_span is not None and best_len > w * 0.35:
+                    spans.append(best_span)
+
+            if spans:
+                left = int(sum(span[0] for span in spans) / len(spans))
+                right = int(sum(span[1] for span in spans) / len(spans))
+                if right - left > 20:
+                    lane_bounds = [int(left + (right - left) * i / config.NUM_LANES)
+                                   for i in range(config.NUM_LANES + 1)]
+                    # Map the player's fixed screen position into the inferred
+                    # road lanes. In this game the car stays near the bottom
+                    # center of the frame while the road shifts underneath.
+                    car_x = w // 2
+                    lane = self._lane_for_x(car_x, lane_bounds)
+                    if lane is not None:
+                        return lane
+        except Exception:
+            # If color-based detection fails for any reason, fall back below.
+            pass
+
+        # Fallback: use the screen center if we cannot see the car clearly.
+        ref_x = w // 2
+        lane = self._lane_for_x(ref_x, lane_bounds)
+        if lane is not None:
+            return lane
+        return -1
     
     # ---- lifecycle ------------------------------------------------
     def start(self) -> None:
@@ -714,6 +805,13 @@ class RealGameInterface(GameInterface):
         )
         self._vehicle_thread.start()
 
+        self._golden_ocr_thread = threading.Thread(
+            target=self._golden_ocr_loop,
+            name="RealGameGoldenOCR",
+            daemon=True,
+        )
+        self._golden_ocr_thread.start()
+
         if self._show_overlay:
             self._overlay_thread = threading.Thread(
                 target=self._overlay_loop,
@@ -736,6 +834,7 @@ class RealGameInterface(GameInterface):
             self._back_reader_thread,
             self._perception_thread,
             self._vehicle_thread,
+            self._golden_ocr_thread,
             self._overlay_thread,
             self._setup_thread,
         ):
@@ -978,6 +1077,8 @@ class RealGameInterface(GameInterface):
 
                     tokens = tuple(item[0] for item in enriched)
                     self._update_state_from_perception(
+                        cv2,
+                        front_frame,
                         front_frame.shape,
                         brightness,
                         tokens,
@@ -1201,6 +1302,8 @@ class RealGameInterface(GameInterface):
 
     def _update_state_from_perception(
         self,
+        cv2,
+        front_frame,
         frame_shape: Tuple[int, ...],
         brightness: float,
         tokens: Tuple[Token, ...],
@@ -1218,9 +1321,13 @@ class RealGameInterface(GameInterface):
             police_car: Police car detection result.
             low_light_active: Whether the frame is uniformly dark.
         """
-        # Integrate own lane from steering: +1 = right at LANE_HOLD_TIME pace.
         now = time.perf_counter()
-        if self._last_command_at is not None:
+        detected_lane = self._detect_player_lane(front_frame, cv2) if front_frame is not None else -1
+
+        # Fall back to steering integration if the visible car cannot be located.
+        if detected_lane >= 0:
+            self._own_lane_float = float(detected_lane)
+        elif self._last_command_at is not None:
             dt = now - self._last_command_at
             self._own_lane_float = max(
                 0.0,
@@ -1230,9 +1337,16 @@ class RealGameInterface(GameInterface):
         self._last_command_at = now
 
         with self._perception_lock:
+            golden_lane_active = (
+                self._golden_lane_seen_at > 0.0
+                and (time.perf_counter() - self._golden_lane_seen_at) <= getattr(config, "REAL_GAME_GOLDEN_OCR_STALE_SEC", 1.5)
+            )
+            golden_time_left = self._golden_banner_time_left
+            if golden_lane_active and golden_time_left <= 0.0:
+                golden_time_left = max(0.0, config.GOLDEN_LANE_WINDOW_SEC - (time.perf_counter() - self._golden_lane_seen_at))
             self._latest_state = GameState(
                 timestamp=now,
-                own_lane=int(round(self._own_lane_float)),
+                own_lane=detected_lane if detected_lane >= 0 else int(round(self._own_lane_float)),
                 # We have no telemetry for actual speed; use the requested
                 # throttle as a proxy. Decision uses this only to widen
                 # look-ahead, so the proxy is good enough.
@@ -1243,9 +1357,9 @@ class RealGameInterface(GameInterface):
                 tokens=tokens,
                 obstacles=(),  # Phase-1 token game has no obstacles per se
                 perception_healthy=True,
-                golden_lane_active=False,
-                golden_lane_index=-1,
-                golden_time_left=0.0,
+                golden_lane_active=golden_lane_active,
+                golden_lane_index=self._golden_banner_lane if golden_lane_active else -1,
+                golden_time_left=golden_time_left if golden_lane_active else 0.0,
                 golden_lane_passed=False,
                 gold_tokens_collected=getattr(self._latest_state, "gold_tokens_collected", 0),
                 red_tokens_collected=getattr(self._latest_state, "red_tokens_collected", 0),
@@ -1305,7 +1419,7 @@ class RealGameInterface(GameInterface):
             # Lane labels below the ROI
         for li in range(len(lane_bounds) - 1):
             cx = (lane_bounds[li] + lane_bounds[li + 1]) // 2
-            cv2.putText(out, f"L{li}", (cx - 12, ry2 + 18),
+            cv2.putText(out, f"L{li + 1}", (cx - 12, ry2 + 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
 
         # 2. ROI rectangle
@@ -1366,9 +1480,12 @@ class RealGameInterface(GameInterface):
         bar_h = 28
         cv2.rectangle(out, (0, 0), (w, bar_h), (28, 28, 28), -1)
         brightness = getattr(cached_state, "brightness", 1.0)
-        status = (f"R={counts[TokenColor.RED]} "
-                  f"G={counts[TokenColor.GREEN]} "
-                  f"Y={counts[TokenColor.YELLOW]}    "
+        own_lane = getattr(cached_state, "own_lane", -1)
+        display_lane = own_lane + 1 if own_lane >= 0 else -1
+        golden_idx = getattr(cached_state, "golden_lane_index", -1)
+        golden_lane = golden_idx + 1 if golden_idx >= 0 else -1
+        status = (f"GL={golden_lane if golden_lane >= 0 else '-'}    "
+                  f"L={display_lane}/{config.NUM_LANES}    "
                   f"B={brightness:.2f} "
                   f"TH={config.LOW_LIGHT_THRESHOLD:.2f}    "
                   f"ACT={self._actuation_label()}    "
@@ -1379,9 +1496,25 @@ class RealGameInterface(GameInterface):
         if getattr(cached_state, "golden_lane_active", False):
             lane_idx = getattr(cached_state, "golden_lane_index", -1)
             time_left = getattr(cached_state, "golden_time_left", 0.0)
-            msg = f"GOLDEN LANE: L{lane_idx} ({time_left:.1f}s)"
+            msg = f"GOLDEN LANE: L{lane_idx + 1} ({time_left:.1f}s)"
             cv2.putText(out, msg, (10, bar_h + 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 215, 255), 2, cv2.LINE_AA)
+            own_lane = getattr(cached_state, "own_lane", -1)
+            if 0 <= own_lane < config.NUM_LANES and 0 <= lane_idx < config.NUM_LANES:
+                if own_lane < lane_idx:
+                    hint = "GO RIGHT"
+                elif own_lane > lane_idx:
+                    hint = "GO LEFT"
+                else:
+                    hint = "ON GOLDEN LANE"
+                cv2.putText(out, hint, (10, bar_h + 48),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+        if self._golden_banner_text:
+            cv2.putText(out, f"OCR: {self._golden_banner_text}", (10, bar_h + 74),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        if self._golden_ocr_status:
+            cv2.putText(out, f"OCR_STATUS: {self._golden_ocr_status}", (10, bar_h + 96),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 255), 1, cv2.LINE_AA)
         if getattr(cached_state, "tactical_win", False):
             cv2.putText(out, "TACTICAL VICTORY", (w // 2 - 120, h // 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3, cv2.LINE_AA)
@@ -1503,10 +1636,145 @@ class RealGameInterface(GameInterface):
             return "LOW_LIGHT"
         if getattr(cached_state, "golden_lane_active", False):
             lane_idx = getattr(cached_state, "golden_lane_index", -1)
-            return f"GOLDEN_L{lane_idx}"
+            return f"GOLDEN_L{lane_idx + 1}"
         if getattr(cached_state, "tactical_win", False):
             return "TACTICAL_WIN"
         return "NORMAL"
+
+    def _golden_ocr_loop(self) -> None:
+        """OCR the exe banner and cache the detected golden lane."""
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+            import mss  # type: ignore
+            import pytesseract  # type: ignore
+        except Exception:
+            return
+
+        # Make pytesseract resilient to PATH differences on Windows.
+        tesseract_cmd = shutil.which("tesseract")
+        if not tesseract_cmd:
+            for candidate in (
+                r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            ):
+                if os.path.exists(candidate):
+                    tesseract_cmd = candidate
+                    break
+        if tesseract_cmd:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+        else:
+            self._golden_ocr_status = "tesseract_missing"
+            return
+
+        period = 1.0 / max(1.0, getattr(config, "REAL_GAME_GOLDEN_OCR_HZ", 3.0))
+        while self._running:
+            start = time.perf_counter()
+            try:
+                bbox = self._find_window_bbox()
+                if bbox is None:
+                    raise RuntimeError("window_not_found")
+                left, top, width, height = bbox
+                x1 = left + int(width * config.REAL_GAME_GOLDEN_OCR_X_FRAC[0])
+                x2 = left + int(width * config.REAL_GAME_GOLDEN_OCR_X_FRAC[1])
+                y1 = top + int(height * config.REAL_GAME_GOLDEN_OCR_Y_FRAC[0])
+                y2 = top + int(height * config.REAL_GAME_GOLDEN_OCR_Y_FRAC[1])
+                if x2 <= x1 or y2 <= y1:
+                    raise RuntimeError("invalid_ocr_region")
+
+                with mss.mss() as sct:
+                    shot = sct.grab({"left": x1, "top": y1, "width": x2 - x1, "height": y2 - y1})
+                    frame = np.array(shot)
+                if frame.shape[2] == 4:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+                # Focus on the brighter banner text and suppress the time line.
+                _, th = cv2.threshold(gray, 170, 255, cv2.THRESH_BINARY)
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+                th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel)
+                th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel)
+                text = pytesseract.image_to_string(th, config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:-!() ")
+                text = " ".join(text.split())
+                lane = self._extract_golden_lane(text)
+
+                if lane is not None:
+                    now = time.perf_counter()
+                    with self._perception_lock:
+                        self._golden_lane_seen_at = now
+                        self._golden_banner_lane = lane - 1
+                        self._golden_banner_text = text
+                        self._golden_banner_time_left = self._extract_seconds_left(text)
+                        self._golden_ocr_status = "ok"
+                else:
+                    self._golden_banner_text = text
+                    self._golden_ocr_status = "no_match"
+            except Exception:
+                self._golden_ocr_status = "ocr_failed"
+
+            sleep_time = period - (time.perf_counter() - start)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    def _extract_golden_lane(self, text: str) -> Optional[int]:
+        """Extract a 1-based lane number from OCR text."""
+        for pattern in (
+            r"\bLANE\s*([1-5])\s*[-:]\s*ALL\s*GREEN\b",
+            r"\bLANE[S]?\s*([1-5])\b",
+            r"\bLANE\s*[:=-]?\s*([1-5])\b",
+            r"\bL\s*([1-5])\b",
+        ):
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _extract_seconds_left(text: str) -> float:
+        m = re.search(r"\((\d+(?:\.\d+)?)s\)", text, flags=re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                pass
+        return 0.0
+
+    @staticmethod
+    def _find_window_bbox() -> Optional[Tuple[int, int, int, int]]:
+        """Find the game window bbox on Windows.
+
+        Prefer the foreground window because the exe title can vary across
+        builds. Fall back to a few known titles if needed.
+        """
+        if not sys.platform.startswith("win"):
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            # Prefer the actual game window. The overlay window can be on top
+            # of it, so we explicitly avoid using the foreground window here.
+            preferred_titles = ("SpeedTrials2D", "RTSE_LIZ")
+            fallback_titles = ("RTOS Perception (RTSE)",)
+
+            for title in preferred_titles:
+                hwnd = user32.FindWindowW(None, title)
+                if hwnd:
+                    rect = wintypes.RECT()
+                    if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                        return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+
+            for title in fallback_titles:
+                hwnd = user32.FindWindowW(None, title)
+                if hwnd:
+                    rect = wintypes.RECT()
+                    if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                        return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+        except Exception:
+            return None
+        return None
 
     @staticmethod
     def _lane_for_x(x: int, lane_bounds: List[int]) -> Optional[int]:

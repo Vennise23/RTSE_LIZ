@@ -226,7 +226,28 @@ def decide(
             )
 
     # ============================================================
-    # 3. CHASE PRESSURE — HIGH PRIORITY OVERRIDE
+    # 3. GOLDEN LANE — HIGH PRIORITY TARGET
+    # ============================================================
+    if getattr(state, "golden_lane_active", False):
+        target = getattr(state, "golden_lane_index", -1)
+        if 0 <= target < config.NUM_LANES:
+            if own < target:
+                return DecisionResult(
+                    Command(CommandKind.MOVE_RIGHT, now, f"GOLDEN_L{target + 1}"),
+                    memory,
+                )
+            if own > target:
+                return DecisionResult(
+                    Command(CommandKind.MOVE_LEFT, now, f"GOLDEN_L{target + 1}"),
+                    memory,
+                )
+            return DecisionResult(
+                Command(CommandKind.HOLD, now, f"GOLDEN_L{target + 1}_ON_TARGET"),
+                memory,
+            )
+
+    # ============================================================
+    # 4. CHASE PRESSURE — HIGH PRIORITY OVERRIDE
     # ============================================================
     if getattr(state, "rear_chase_active", False):
         pressure = getattr(state, "rear_pressure", 0.0)
@@ -244,7 +265,7 @@ def decide(
             )
 
     # ============================================================
-    # 4. NORMAL COST POLICY
+    # 5. NORMAL COST POLICY
     # ============================================================
     lookahead = _effective_lookahead(state.speed_norm)
 
