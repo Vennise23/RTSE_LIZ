@@ -26,8 +26,8 @@ COMMAND_QUEUE_MAX = 8
 # ----------------------------------------------------------------------
 # Game / world model
 # ----------------------------------------------------------------------
-NUM_LANES = 3                # 0 = left, 1 = center, 2 = right
-LANE_CENTER_INDEX = 1
+NUM_LANES = 5                # 0 = leftmost, 2 = center, 4 = rightmost
+LANE_CENTER_INDEX = 2
 DISTANCE_HORIZON = 1.0       # normalized distance ahead the perception reports
 TOKEN_REACHED_DISTANCE = 0.05  # tokens closer than this are considered consumed/missed
 
@@ -115,6 +115,16 @@ POLICE_CAR_REQUIRED_TOKEN_COLOR = "red"
 POLICE_CAR_SPEED_PENALTY_FACTOR = 0.5
 
 # ----------------------------------------------------------------------
+# Challenge 4: golden lane / tactical victory
+# ----------------------------------------------------------------------
+GOLDEN_LANE_MIN_APPEAR_SEC = 10.0
+GOLDEN_LANE_MAX_APPEAR_SEC = 55.0
+GOLDEN_LANE_WINDOW_SEC = 5.0
+GOLDEN_LANE_MIN_LENGTH_SEC = 5.0
+TACTICAL_GREEN_GOAL = 60
+TACTICAL_REQUIRED_EVENT_PASSES = 5
+
+# ----------------------------------------------------------------------
 # Actuation calibration (rule-based mapping from lane decision -> floats)
 # ----------------------------------------------------------------------
 # steering_input domain is [-1.0, +1.0] (left .. right) for the real game.
@@ -153,8 +163,8 @@ GAME_CONTROL_HOST = "127.0.0.1"
 GAME_CONTROL_PORT = 8081
 
 # Lane boundaries as fractions of the front-camera frame width.
-# The road in SpeedTrials2D occupies roughly the middle 70 %; split into thirds.
-LANE_X_BOUNDS_FRAC = (0.15, 0.38, 0.62, 0.85)  # 4 edges -> 3 lanes
+# The road in SpeedTrials2D occupies roughly the middle 70 %; split into five lanes.
+LANE_X_BOUNDS_FRAC = (0.15, 0.29, 0.43, 0.57, 0.71, 0.85)  # 6 edges -> 5 lanes
 
 # Vertical region of interest for token detection (fractions of frame height).
 ROI_Y_FRAC = (0.05, 0.70)
@@ -170,4 +180,4 @@ REAL_GAME_REAR_VEHICLE_ROI_X_FRAC = (0.15, 0.85)
 REAL_GAME_REAR_VEHICLE_ROI_Y_FRAC = (0.35, 0.95)
 
 # Mock-mode default duration (seconds). Real-mode runs until Ctrl+C.
-MOCK_RUN_SECONDS_DEFAULT = 20.0
+MOCK_RUN_SECONDS_DEFAULT = 180.0

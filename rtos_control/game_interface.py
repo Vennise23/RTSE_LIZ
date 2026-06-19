@@ -141,6 +141,15 @@ class MockGameInterface(GameInterface):
         self._police_collision_done = False
         self._police_appear_at = 0.0
         self._last_player_red_token = 0.0
+        self._golden_lane_active = False
+        self._golden_lane_index = -1
+        self._golden_lane_started_at = 0.0
+        self._golden_lane_expires_at = 0.0
+        self._golden_lane_passed = False
+        self._golden_lane_announce_at = 0.0
+        self._event_pass_count = 0
+        self._gold_tokens_collected = 0
+        self._red_tokens_collected = 0
         self._game_over = False
         self._game_over_reason = ""
         # Effect of the last steering command: positive = steering right.
@@ -157,6 +166,9 @@ class MockGameInterface(GameInterface):
         self._next_obstacle_spawn = now + 1.0
         self._police_appear_at = config.POLICE_CAR_MIN_APPEAR_SEC + self._rng.random() * (
             config.POLICE_CAR_MAX_APPEAR_SEC - config.POLICE_CAR_MIN_APPEAR_SEC
+        )
+        self._golden_lane_announce_at = config.GOLDEN_LANE_MIN_APPEAR_SEC + self._rng.random() * (
+            config.GOLDEN_LANE_MAX_APPEAR_SEC - config.GOLDEN_LANE_MIN_APPEAR_SEC
         )
         self._started = True
 
@@ -176,6 +188,7 @@ class MockGameInterface(GameInterface):
         self._update_low_light(now, dt)
         self._update_chase_state(now, dt)
         self._update_police_state(now, dt)
+        self._update_golden_lane_state(now, dt)
 
         if self._game_over:
             self._speed_norm = 0.0
@@ -215,6 +228,15 @@ class MockGameInterface(GameInterface):
             for o in self._obstacles
             if o.distance - flow * dt > 0.0
         ]
+
+        for tok in self._tokens:
+            if tok.distance <= config.TOKEN_REACHED_DISTANCE:
+                if tok.color == TokenColor.GREEN:
+                    self._gold_tokens_collected += 1
+                elif tok.color == TokenColor.RED:
+                    self._red_tokens_collected += 1
+
+        self._update_tactical_victory()
 
         # Spawn new tokens periodically at the horizon.
         while now >= self._next_token_spawn:
@@ -296,6 +318,40 @@ class MockGameInterface(GameInterface):
     def _mark_red_token_taken(self, now: float) -> None:
         self._last_player_red_token = now
 
+    def _update_golden_lane_state(self, now: float, dt: float) -> None:
+        if self._run_started_at is None:
+            self._run_started_at = now
+        elapsed = now - self._run_started_at
+
+        if not self._golden_lane_active and self._golden_lane_index < 0:
+            if elapsed >= self._golden_lane_announce_at:
+                self._golden_lane_active = True
+                self._golden_lane_started_at = now
+                self._golden_lane_expires_at = now + max(
+                    config.GOLDEN_LANE_WINDOW_SEC,
+                    config.GOLDEN_LANE_MIN_LENGTH_SEC,
+                )
+                self._golden_lane_index = self._rng.randrange(config.NUM_LANES)
+                self._golden_lane_passed = False
+        elif self._golden_lane_active:
+            if now >= self._golden_lane_expires_at:
+                self._golden_lane_passed = (self._own_lane == self._golden_lane_index)
+                if self._golden_lane_passed:
+                    self._event_pass_count += 1
+                self._golden_lane_active = False
+                self._golden_lane_index = -1
+                self._golden_lane_expires_at = 0.0
+
+    def _update_tactical_victory(self) -> None:
+        if self._game_over:
+            return
+        if (
+            self._gold_tokens_collected - self._red_tokens_collected >= config.TACTICAL_GREEN_GOAL
+            and self._event_pass_count >= config.TACTICAL_REQUIRED_EVENT_PASSES
+        ):
+            self._game_over = True
+            self._game_over_reason = "tactical_victory"
+
     def _update_chase_state(self, now: float, dt: float) -> None:
         """Trigger the two chase-car appearances and update pressure."""
         if self._run_started_at is None:
@@ -357,6 +413,15 @@ class MockGameInterface(GameInterface):
                 police_lane=self._police_lane,
                 police_time_left=max(0.0, self._police_expires_at - time.perf_counter())
                     if self._police_active else 0.0,
+                golden_lane_active=self._golden_lane_active,
+                golden_lane_index=self._golden_lane_index,
+                golden_time_left=max(0.0, self._golden_lane_expires_at - time.perf_counter())
+                    if self._golden_lane_active else 0.0,
+                golden_lane_passed=self._golden_lane_passed,
+                gold_tokens_collected=self._gold_tokens_collected,
+                red_tokens_collected=self._red_tokens_collected,
+                event_pass_count=self._event_pass_count,
+                tactical_win=self._game_over_reason == "tactical_victory",
                 game_over=self._game_over,
                 game_over_reason=self._game_over_reason,
                 tokens=tuple(self._tokens),
@@ -821,6 +886,14 @@ class RealGameInterface(GameInterface):
                 police_alert=False,
                 police_lane=-1,
                 police_time_left=0.0,
+                golden_lane_active=False,
+                golden_lane_index=-1,
+                golden_time_left=0.0,
+                golden_lane_passed=False,
+                gold_tokens_collected=0,
+                red_tokens_collected=0,
+                event_pass_count=0,
+                tactical_win=False,
                 game_over=False,
                 game_over_reason="",
                 tokens=(),
@@ -1165,11 +1238,19 @@ class RealGameInterface(GameInterface):
                 # look-ahead, so the proxy is good enough.
                 speed_norm=max(0.0, min(1.0, self._last_acceleration)),
                 brightness=brightness,
-                    low_light_active=low_light_active,
+                low_light_active=low_light_active,
                 game_over_reason="",
                 tokens=tokens,
                 obstacles=(),  # Phase-1 token game has no obstacles per se
                 perception_healthy=True,
+                golden_lane_active=False,
+                golden_lane_index=-1,
+                golden_time_left=0.0,
+                golden_lane_passed=False,
+                gold_tokens_collected=getattr(self._latest_state, "gold_tokens_collected", 0),
+                red_tokens_collected=getattr(self._latest_state, "red_tokens_collected", 0),
+                event_pass_count=getattr(self._latest_state, "event_pass_count", 0),
+                tactical_win=getattr(self._latest_state, "tactical_win", False),
             )
 
     # ---- overlay --------------------------------------------------
@@ -1295,6 +1376,16 @@ class RealGameInterface(GameInterface):
         cv2.putText(out, status, (10, 19),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 1, cv2.LINE_AA)
 
+        if getattr(cached_state, "golden_lane_active", False):
+            lane_idx = getattr(cached_state, "golden_lane_index", -1)
+            time_left = getattr(cached_state, "golden_time_left", 0.0)
+            msg = f"GOLDEN LANE: L{lane_idx} ({time_left:.1f}s)"
+            cv2.putText(out, msg, (10, bar_h + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 215, 255), 2, cv2.LINE_AA)
+        if getattr(cached_state, "tactical_win", False):
+            cv2.putText(out, "TACTICAL VICTORY", (w // 2 - 120, h // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3, cv2.LINE_AA)
+
         if not self._overlay_window_ready:
             self._init_overlay_window(cv2)
         cv2.imshow(self._overlay_window, out)
@@ -1410,6 +1501,11 @@ class RealGameInterface(GameInterface):
         """
         if getattr(cached_state, "brightness", 1.0) < config.LOW_LIGHT_THRESHOLD:
             return "LOW_LIGHT"
+        if getattr(cached_state, "golden_lane_active", False):
+            lane_idx = getattr(cached_state, "golden_lane_index", -1)
+            return f"GOLDEN_L{lane_idx}"
+        if getattr(cached_state, "tactical_win", False):
+            return "TACTICAL_WIN"
         return "NORMAL"
 
     @staticmethod

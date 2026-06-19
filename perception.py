@@ -16,6 +16,7 @@ import numpy as np
 
 import comms
 import rtos
+from rtos_control import config
 from rtos import shared_data, data_lock
 
 
@@ -303,8 +304,8 @@ def processing_task():
 
     lane_centers = processing_task.cached_lane_centers
 
-    # simple fallback
-    current_lane = 2 if len(lane_centers) == 0 else 2
+    # Fallback: assume the center lane when lane detection is unavailable.
+    current_lane = config.LANE_CENTER_INDEX
 
     # -----------------------------
     # 7. WRITE BACK SHARED DATA

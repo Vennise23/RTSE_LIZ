@@ -33,7 +33,10 @@ def build_perception_task(game: GameInterface, shared: SharedState):
         state = game.read_state()
         shared.update_state(state)
         if getattr(state, "game_over", False):
-            return f"GAME_OVER:{getattr(state, 'game_over_reason', 'unknown')}"
+            reason = getattr(state, "game_over_reason", "unknown")
+            if reason == "tactical_victory":
+                return "TACTICAL_VICTORY"
+            return f"GAME_OVER:{reason}"
         if not state.perception_healthy:
             return "perception_unhealthy"
         return ""
