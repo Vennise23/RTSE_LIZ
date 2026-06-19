@@ -32,6 +32,8 @@ def build_perception_task(game: GameInterface, shared: SharedState):
     def body() -> Optional[str]:
         state = game.read_state()
         shared.update_state(state)
+        if getattr(state, "game_over", False):
+            return f"GAME_OVER:{getattr(state, 'game_over_reason', 'unknown')}"
         if not state.perception_healthy:
             return "perception_unhealthy"
         return ""
@@ -50,6 +52,14 @@ def build_decision_task(
 
     def body() -> Optional[str]:
         snap = shared.snapshot()
+        if getattr(snap.state, "game_over", False):
+            cmd = Command(
+                kind=CommandKind.HOLD,
+                issued_at=time.perf_counter(),
+                reason=f"game_over:{getattr(snap.state, 'game_over_reason', 'unknown')}",
+            )
+            _enqueue_latest(command_q, cmd)
+            return "game_over"
         # If perception is stale we should not act on it. Push a HOLD
         # so actuation just keeps the wheel centred and let watchdog
         # decide whether to escalate.
@@ -77,6 +87,10 @@ def build_decision_task(
         result = decide(snap.state, memory[0])
         memory[0] = result.memory
         _enqueue_latest(command_q, result.command)
+        if memory[0].low_light_active:
+            return f"LOW_LIGHT detected brightness={snap.state.brightness:.2f}"
+        if snap.state.brightness < config.LOW_LIGHT_THRESHOLD:
+            return f"LOW_LIGHT pending brightness={snap.state.brightness:.2f}"
         return result.command.kind.value
     return body
 
@@ -167,6 +181,8 @@ def _command_to_floats(cmd: Command, now: float):
         return (0.0, config.ACCEL_SLOWDOWN, now)
     if cmd.kind is CommandKind.SPEED_UP:
         return (0.0, config.ACCEL_CRUISE, now)
+    if cmd.kind is CommandKind.RECOVER_LIGHT:
+        return (0.0, -1.0, now)
     if cmd.kind is CommandKind.DEGRADE:
         return (0.0, config.ACCEL_BRAKE, now)
     # HOLD

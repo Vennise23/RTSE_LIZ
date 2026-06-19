@@ -619,8 +619,15 @@ def processing_task():
                 (0, 255, 255)
 
         cv2.rectangle(debug, (x, y), (x + w, y + h), color, 2)
-        cv2.putText(debug, token['color'], (x, y - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        cv2.putText(
+            debug,
+            token['color'],
+            (x, y - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1
+        )
 
     debug = cv2.resize(debug, (640, 480))
 
