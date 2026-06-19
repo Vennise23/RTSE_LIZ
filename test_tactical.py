@@ -61,6 +61,13 @@ run("1b. green two lanes (lane 4)", [tok('green', 4, 230), tok('green', 4, 190)]
 # 1c. Empty road -> hold lane, no needless zig-zag.
 run("1c. empty road -> hold", [])
 
+# 1d. Green AND a close red in the SAME lane (3) -> do NOT enter it for green.
+run("1d. green+close-red lane 3", [tok('green', 3, 250), tok('red', 3, 310)])
+
+# 1e. Green in lane 3, only a FAR red in lane 1 -> still take the green.
+run("1e. green L3, far red L1", [tok('green', 3, 250), tok('green', 3, 210),
+                                 tok('red', 1, 150)])
+
 # 2. Red dead ahead in our lane -> emergency escape, never sit on it.
 run("2. red in current lane", [tok('red', 2, 300)])
 

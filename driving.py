@@ -93,16 +93,24 @@ def build_lane_maps(tokens, lane_centers, frame_h):
     """
     n = len(lane_centers)
     red = {i: False for i in range(n)}
+    close_red = {i: False for i in range(n)}
     yellow = {i: False for i in range(n)}
     green_score = {i: 0.0 for i in range(n)}
+    red_score = {i: 0.0 for i in range(n)}
 
     forward_cut = max(int(frame_h * 0.85), 1)
+    close_cut = frame_h * 0.55           # below this y a red is imminent
     for t in tokens:
         if t['y'] >= forward_cut:
             continue  # too low in frame -> already at the car, can't steer to it
         i = lane_of(t['x'], lane_centers)
         if t['color'] == 'red':
             red[i] = True
+            if t['y'] > close_cut:
+                close_red[i] = True
+            # CLOSER red = bigger penalty (about to be collected). Reds repel
+            # harder than greens attract, so we never take a red for a green.
+            red_score[i] += t['y'] / forward_cut
         elif t['color'] == 'yellow':
             yellow[i] = True
         elif t['color'] == 'green':
@@ -111,7 +119,7 @@ def build_lane_maps(tokens, lane_centers, frame_h):
             # matters as much as nearness so we genuinely farm green (net +60).
             w = (forward_cut - t['y']) / forward_cut
             green_score[i] += max(0.0, w)
-    return red, yellow, green_score
+    return red, close_red, yellow, green_score, red_score
 
 
 def nearest_red_lane(tokens, lane_centers, current_lane, frame_h, avoid_lane):
@@ -146,7 +154,8 @@ def decide(tokens, lane_centers, current_lane, frame_h, ev):
     if n == 0:
         return -1, "no_lane"
 
-    red, yellow, green_score = build_lane_maps(tokens, lane_centers, frame_h)
+    red, close_red, yellow, green_score, red_score = build_lane_maps(
+        tokens, lane_centers, frame_h)
 
     cop_lane = ev['police_lane'] if ev['police'] else -1
     golden = ev['golden_lane']
@@ -181,35 +190,35 @@ def decide(tokens, lane_centers, current_lane, frame_h, ev):
     # ---------------------------------------------------------------
     # EV5 GOLDEN — lock onto the golden lane and hold until it expires.
     # ---------------------------------------------------------------
-    if golden >= 0 and golden < n and not red[golden]:
+    if golden >= 0 and golden < n and not close_red[golden]:
         return golden, "EV5_GOLDEN_HOLD"
 
     # ---------------------------------------------------------------
-    # SAFETY — never sit on a red, escape RRV traps fast.
+    # SAFETY — only a CLOSE red in our lane is an emergency; far reds are
+    # handled smoothly by the scoring penalty below (earlier, less jerky).
     # ---------------------------------------------------------------
-    if red[current_lane]:
-        return nearest_safe_lane(current_lane, red, n, avoid=cop_lane), "EMERGENCY_RED"
-    if is_trapped(current_lane, red, n):
-        return nearest_safe_lane(current_lane, red, n, avoid=cop_lane), "TRAP_ESCAPE"
+    if close_red[current_lane]:
+        return nearest_safe_lane(current_lane, close_red, n, avoid=cop_lane), "EMERGENCY_RED"
+    if is_trapped(current_lane, close_red, n):
+        return nearest_safe_lane(current_lane, close_red, n, avoid=cop_lane), "TRAP_ESCAPE"
 
     # ---------------------------------------------------------------
-    # TACTICAL GREEN — score lanes: chase green, keep a wide safe corridor,
-    # punish reds/yellows, prefer not to zig-zag, never touch the cop lane.
+    # TACTICAL — minimise red FIRST, then farm green. Reds repel by proximity
+    # (a near red is a big penalty, a far one small); greens attract; an
+    # imminent red lane is never entered. Red weight (300) > green weight (170)
+    # so we never trade a red for a green, but we still cross for clean green.
     # ---------------------------------------------------------------
-    # Net green is the win bottleneck, so this is tuned to COMMIT to green:
-    # green reward dominates, stability is a light anti-zigzag nudge, and a
-    # green two lanes away is still worth crossing for. Red lanes are excluded
-    # outright (never chase green into a red), so being aggressive stays safe.
     best_lane, best_score = current_lane, -1e9
     for i in range(n):
-        if red[i]:
-            continue
+        if close_red[i]:
+            continue                              # never enter an imminent red
         score = 0.0
-        score += green_score[i] * 170.0           # PRIMARY: farm green (net +60)
-        score += safe_corridor_score(i, red, n) * 18.0
+        score += green_score[i] * 170.0           # farm green (net +60)
+        score -= red_score[i] * 300.0             # PRIMARY: avoid red (repels harder)
+        score += safe_corridor_score(i, red, n) * 15.0
         score -= abs(i - current_lane) * 18.0      # light anti-zigzag only
         if yellow[i]:
-            score -= 110.0
+            score -= 100.0
         if i == cop_lane:
             score -= 1e6                            # hard-avoid the cop lane
         if score > best_score:
@@ -217,8 +226,9 @@ def decide(tokens, lane_centers, current_lane, frame_h, ev):
     # Hold current lane unless another lane is clearly better — kills 1-tick
     # flip-flop when two lanes score within a hair of each other.
     cur_score = (green_score[current_lane] * 170.0
-                 + safe_corridor_score(current_lane, red, n) * 18.0) \
-        if not red[current_lane] else -1e9
+                 - red_score[current_lane] * 300.0
+                 + safe_corridor_score(current_lane, red, n) * 15.0) \
+        if not close_red[current_lane] else -1e9
     if best_lane != current_lane and best_score - cur_score < 25.0:
         return current_lane, "TACTICAL_HOLD"
     return best_lane, "TACTICAL_GREEN"
