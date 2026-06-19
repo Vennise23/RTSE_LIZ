@@ -26,6 +26,7 @@ collision game-over; golden can be re-passed on the next rotation.)
 """
 
 import struct
+import time
 import numpy as np
 import comms
 from rtos import shared_data, data_lock
@@ -40,8 +41,28 @@ _lock_counter = 0
 _speed_mem = 0.85
 _last_reason = ""
 _counter = 0
+_t0 = None                 # wall-clock of first decision ~= game start
 
 PRINT_EVERY = 20
+
+# --- EV2 Police: it needs us to TAKE a red within 5s, which fights our
+# avoid-red policy, so it's the one event that keeps failing. We can't see the
+# cop, but we CAN read EV2's pass status off the HUD and estimate the police
+# window from the event rotation (police is 30-50s into each 60s cycle). While
+# EV2 is still pending AND we're inside that window, we deliberately grab the
+# nearest red to satisfy it, then stop.
+#
+# DEFAULT OFF: distance is the realistic objective (the +60 tactical win is out
+# of reach), and fishing collects extra reds that tank the speed multiplier and
+# hurt distance. Live test confirmed it fires correctly and police did pass, but
+# the pass could not be cleanly attributed to fishing vs a chance red. Flip ON
+# only if deliberately gambling on event-completion over distance.
+POLICE_FISHING = False
+POLICE_WINDOW = (27.0, 53.0)   # seconds into each 60s cycle (widened for clock slop)
+
+
+def _in_police_window(elapsed):
+    return POLICE_WINDOW[0] <= (elapsed % 60.0) <= POLICE_WINDOW[1]
 
 
 # =========================
@@ -175,6 +196,17 @@ def decide(tokens, lane_centers, current_lane, frame_h, ev):
         return target, "EV2_POLICE_TAKE_RED"
 
     # ---------------------------------------------------------------
+    # EV2 POLICE FISHING — can't see the cop, but EV2 is still pending and we
+    # are inside the estimated police window: deliberately grab the nearest red
+    # token (a token, NOT the cop car) to satisfy the event.
+    # ---------------------------------------------------------------
+    if ev.get('police_fish'):
+        target = nearest_red_lane(tokens, lane_centers, current_lane, frame_h, -1)
+        if target >= 0:
+            return target, "EV2_FISH_RED"
+        # no red on screen yet -> fall through and drive normally
+
+    # ---------------------------------------------------------------
     # EV3/EV4 CHASING — car behind in our lane -> dodge to a DIFFERENT lane.
     # ---------------------------------------------------------------
     if rear == current_lane and rear >= 0:
@@ -272,7 +304,7 @@ def control(target_lane, lane_centers, frame_w, rear_close):
 # =========================
 def driving_logic_task():
     global _lane_lock, _lock_counter
-    global _counter, _last_reason, _speed_mem
+    global _counter, _last_reason, _speed_mem, _t0
 
     with data_lock:
         frame = shared_data['latest_front_frame']
@@ -280,6 +312,7 @@ def driving_logic_task():
         lane_centers = list(shared_data['lane_centers'])
         current_lane = shared_data['current_lane']
         rear_close = shared_data['rear_vehicle_close']
+        events_passed = list(shared_data.get('events_passed', [False] * 5))
         ev = {
             'darkness': shared_data['event_darkness'],
             'police': shared_data['event_police'],
@@ -290,6 +323,15 @@ def driving_logic_task():
 
     if frame is None:
         return
+
+    # EV2 police fishing: pending (not yet passed) AND inside the estimated
+    # police window of the event rotation. Anchor _t0 to the first frame that
+    # actually shows tokens (~ gameplay start, not the waiting screen) so the
+    # window estimate lines up with the game's event clock.
+    if _t0 is None and tokens:
+        _t0 = time.perf_counter()
+    ev['police_fish'] = (POLICE_FISHING and not events_passed[1] and _t0 is not None
+                         and _in_police_window(time.perf_counter() - _t0))
 
     h, w, _ = frame.shape
 
@@ -319,7 +361,7 @@ def driving_logic_task():
     # Event lanes (police/golden/dodge) must take effect immediately — only the
     # ordinary green-farming target gets the hysteresis lock.
     instant = reason in ("EV2_POLICE_TAKE_RED", "EV2_POLICE_WAIT_RED",
-                         "EV34_CHASING_DODGE", "EV5_GOLDEN_HOLD",
+                         "EV2_FISH_RED", "EV34_CHASING_DODGE", "EV5_GOLDEN_HOLD",
                          "EMERGENCY_RED", "TRAP_ESCAPE")
     if instant or _lane_lock == -1:
         _lane_lock = target
