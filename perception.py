@@ -20,7 +20,10 @@ import rtos
 from rtos import shared_data, data_lock
 
 
-SHOW_CAMERA = True
+# Set env RTSE_NO_WINDOW=1 to suppress all OpenCV windows. IMPORTANT for frame
+# capture: the Unity game PAUSES/freezes when our cv2 windows steal focus (this
+# is why the rear camera went static mid-capture), so capture runs must use it.
+SHOW_CAMERA = os.environ.get("RTSE_NO_WINDOW") != "1"
 # Set env RTSE_DUMP=<dir> to save a handful of raw front frames for offline
 # inspection / CV tuning. Default off — zero impact on normal runs.
 _DUMP_DIR = os.environ.get("RTSE_DUMP")
@@ -481,6 +484,8 @@ def processing_task():
         processing_task.dump_n = 0
         processing_task.last_dump_time = 0
         processing_task.events_passed = [False, False, False, False, False]
+        processing_task.prev_passed = [False, False, False, False, False]
+        processing_task.dump_burst = 0   # frames left to grab fast after an event
 
     # -----------------------------
     # 3. SKIP OLD FRAME (CRITICAL)
@@ -563,6 +568,12 @@ def processing_task():
             processing_task.events_passed[idx] = True
     events_passed = list(processing_task.events_passed)
 
+    # When any EV label flips to PASSED, an event just resolved -> trigger a
+    # burst capture so we grab the police/chasing car that was on screen.
+    if events_passed != processing_task.prev_passed:
+        processing_task.dump_burst = 5
+        processing_task.prev_passed = list(events_passed)
+
     # Crude token-flow counter for the operator HUD (best effort).
     green_total = sum(1 for t in detected_tokens if t['color'] == 'green')
     if green_total < processing_task.prev_green_total:
@@ -588,16 +599,26 @@ def processing_task():
     # -----------------------------
     # 7b. OPTIONAL FRAME DUMP (CV tuning) — env RTSE_DUMP=<dir>
     # -----------------------------
-    if _DUMP_DIR and processing_task.dump_n < _DUMP_N and now - processing_task.last_dump_time > _DUMP_GAP:
+    bursting = processing_task.dump_burst > 0
+    due = bursting or now - processing_task.last_dump_time > _DUMP_GAP
+    if _DUMP_DIR and processing_task.dump_n < _DUMP_N and due:
         processing_task.last_dump_time = now
+        if bursting:
+            processing_task.dump_burst -= 1
         try:
             os.makedirs(_DUMP_DIR, exist_ok=True)
-            fn = os.path.join(_DUMP_DIR, f"front_{processing_task.dump_n}.png")
-            cv2.imwrite(fn, front_frame)
+            n = processing_task.dump_n
+            cv2.imwrite(os.path.join(_DUMP_DIR, f"front_{n}.png"), front_frame)
+            # Grab the REAR frame too (chasing cars approach from behind).
+            with data_lock:
+                back_frame = shared_data.get('latest_back_frame')
+            if back_frame is not None:
+                cv2.imwrite(os.path.join(_DUMP_DIR, f"rear_{n}.png"), back_frame)
             greens = sum(1 for t in detected_tokens if t['color'] == 'green')
             reds = sum(1 for t in detected_tokens if t['color'] == 'red')
             passed_str = "".join("1" if p else "0" for p in events_passed)
-            print(f"[DUMP] {fn} bright={bright:.2f} green={greens} red={reds} "
+            tag = "BURST" if bursting else "tick "
+            print(f"[DUMP {tag}] n={n} bright={bright:.2f} green={greens} red={reds} "
                   f"golden={golden_lane} EVpassed={passed_str} (raw={ev_raw})")
             processing_task.dump_n += 1
         except Exception as e:

@@ -48,9 +48,22 @@ Driving weights (green vs corridor vs stability) are at the bottom of
 `decide()` in `driving.py`.
 
 ## Debug capture (for tuning)
-`RTSE_DUMP=<dir> RTSE_DUMP_N=30 RTSE_DUMP_GAP=1.5 python sample_drive.py`
-saves front frames + logs `[DUMP] bright= green= red= golden= EVpassed=` so you
-can calibrate against real gameplay (this is how the above was tuned).
+`RTSE_NO_WINDOW=1 RTSE_DUMP=<dir> RTSE_DUMP_N=60 RTSE_DUMP_GAP=2.0 python sample_drive.py`
+- saves BOTH `front_N.png` and `rear_N.png`, logs `[DUMP] bright= green= red=
+  golden= EVpassed=`.
+- **`RTSE_NO_WINDOW=1` is essential**: the Unity game pauses/freezes when our
+  cv2 windows steal focus, which freezes the camera mid-capture.
+- It also **burst-captures 5 frames whenever an EV label flips to passed**, to
+  grab the police/chasing car that was on screen at that moment.
+
+### To finish EV2/EV3/EV4 (need real event frames)
+Police (EV2) is a blue+red car AHEAD (front cam); chasing (EV3/EV4) is a car
+BEHIND (rear cam). Generic color/blob detection does NOT work on this night
+scene (blue sky, our own red car, dark rear road all mimic the targets). Run
+the capture above for a full game so the `front_*/rear_*` frames around those
+events get saved, identify the car's real signature, then write a targeted
+detector. Same applies to OCR-ing the Golden-Lane banner digit ("LANE N — ALL
+GREEN") for EV5's exact lane.
 
 ## Offline logic test (no game needed)
 `python test_tactical.py` — feeds synthetic tokens/events through the real
