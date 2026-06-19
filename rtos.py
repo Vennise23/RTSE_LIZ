@@ -31,6 +31,27 @@ shared_data = {
     'current_lane': -1,          # index into lane_centers; -1 if unknown
     'rear_vehicle_close': False, # True when a fast car is closing in from behind
 
+    # ---------------------------------------------------------------
+    # V3.0 Game-Day EVENT STATE (written by perception, read by driving)
+    # All events are perceived from the camera streams only — the game
+    # exposes no telemetry channel (confirmed by decompiling the build).
+    # ---------------------------------------------------------------
+    'brightness': 1.0,           # mean normalized brightness of front frame [0..1]
+    'event_darkness': False,     # EV1: brightness collapsed -> must brake fully (accel=-1)
+    'event_police': False,       # EV2: police car ahead -> must grab a red token, never hit cop
+    'police_lane': -1,           # EV2: lane the cop occupies (HARD avoid, collision = GAME OVER)
+    'event_golden_lane': -1,     # EV5: lane index that is "golden" right now, else -1
+    'rear_threat_lane': -1,      # EV3/EV4: lane of a chasing car closing from behind, else -1
+
+    # EV1..EV5 pass status read straight off the in-frame HUD tracker
+    # (green label = PASSED, red label = still pending). This IS the tactical
+    # win progress: the team must pass every event at least once.
+    'events_passed': [False, False, False, False, False],
+
+    # Tactical bookkeeping (best-effort, for the operator HUD)
+    'green_seen': 0,
+    'red_seen': 0,
+
     # Member 3 — driving logic decision (debug)
     'target_lane': -1,
     'decision_reason': 'init',
