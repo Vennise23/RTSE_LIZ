@@ -90,7 +90,7 @@ def build_decision_task(
         result = decide(snap.state, memory[0])
         memory[0] = result.memory
         _enqueue_latest(command_q, result.command)
-        if memory[0].low_light_active:
+        if snap.state.low_light_active:
             return f"LOW_LIGHT detected brightness={snap.state.brightness:.2f}"
         if snap.state.brightness < config.LOW_LIGHT_THRESHOLD:
             return f"LOW_LIGHT pending brightness={snap.state.brightness:.2f}"

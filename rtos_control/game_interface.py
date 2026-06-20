@@ -502,6 +502,11 @@ class RealGameInterface(GameInterface):
         self._golden_banner_text = ""
         self._golden_banner_time_left = 0.0
         self._golden_ocr_status = ""
+        # Latched golden-lane event state for real mode. OCR can flicker
+        # frame-to-frame, so keep the event active for its full window once seen.
+        self._golden_event_active = False
+        self._golden_event_lane = -1
+        self._golden_event_expires_at = 0.0
 
         # Lane-of-self tracking (we never get told, so we integrate from
         # our own steering commands). 0 .. NUM_LANES-1.
@@ -675,7 +680,12 @@ class RealGameInterface(GameInterface):
     ) -> Dict[str, any]:
         """Detect chase car in frame."""
         self._load_templates()
-        return self._detect_vehicle(frame, self._chasing_templates, cv2, threshold=0.70)
+        return self._detect_vehicle(
+            frame,
+            self._chasing_templates,
+            cv2,
+            threshold=float(getattr(config, "REAL_GAME_CHASE_DETECTION_THRESHOLD", 0.70)),
+        )
 
     def _detect_police_car(
         self,
@@ -684,7 +694,12 @@ class RealGameInterface(GameInterface):
     ) -> Dict[str, any]:
         """Detect police car in frame."""
         self._load_templates()
-        return self._detect_vehicle(frame, self._police_templates, cv2, threshold=0.70)
+        return self._detect_vehicle(
+            frame,
+            self._police_templates,
+            cv2,
+            threshold=float(getattr(config, "REAL_GAME_POLICE_DETECTION_THRESHOLD", 0.70)),
+        )
 
     def _detect_player_lane(
         self,
@@ -1337,13 +1352,29 @@ class RealGameInterface(GameInterface):
         self._last_command_at = now
 
         with self._perception_lock:
-            golden_lane_active = (
-                self._golden_lane_seen_at > 0.0
-                and (time.perf_counter() - self._golden_lane_seen_at) <= getattr(config, "REAL_GAME_GOLDEN_OCR_STALE_SEC", 1.5)
-            )
-            golden_time_left = self._golden_banner_time_left
-            if golden_lane_active and golden_time_left <= 0.0:
-                golden_time_left = max(0.0, config.GOLDEN_LANE_WINDOW_SEC - (time.perf_counter() - self._golden_lane_seen_at))
+            # Vehicle detections run in a slower side loop. Treat stale
+            # outputs as unavailable to avoid ghost event flags.
+            vehicle_stale_sec = max(0.5, 2.0 / max(1.0, getattr(config, "REAL_GAME_VEHICLE_DETECTION_HZ", 4.0)))
+            vehicle_fresh = (now - self._last_vehicle_detection_at) <= vehicle_stale_sec
+
+            chase_detected = bool(chasing_car.get("detected", False)) if vehicle_fresh else False
+            police_detected = bool(police_car.get("detected", False)) if vehicle_fresh else False
+
+            chase_lane = int(chasing_car.get("lane", -1)) if chase_detected else -1
+            police_lane = int(police_car.get("lane", -1)) if police_detected else -1
+            if not (0 <= chase_lane < config.NUM_LANES):
+                chase_lane = -1
+            if not (0 <= police_lane < config.NUM_LANES):
+                police_lane = -1
+
+            # Use latched event timing instead of OCR freshness so temporary OCR
+            # drops do not terminate the event before the 5-second deadline.
+            if self._golden_event_active and now >= self._golden_event_expires_at:
+                self._golden_event_active = False
+                self._golden_event_lane = -1
+
+            golden_lane_active = self._golden_event_active
+            golden_time_left = max(0.0, self._golden_event_expires_at - now) if golden_lane_active else 0.0
             self._latest_state = GameState(
                 timestamp=now,
                 own_lane=detected_lane if detected_lane >= 0 else int(round(self._own_lane_float)),
@@ -1353,12 +1384,19 @@ class RealGameInterface(GameInterface):
                 speed_norm=max(0.0, min(1.0, self._last_acceleration)),
                 brightness=brightness,
                 low_light_active=low_light_active,
+                rear_pressure=1.0 if chase_detected else 0.0,
+                rear_chase_active=chase_detected,
+                rear_chase_lane=chase_lane,
+                rear_time_left=config.CHASE_CAR_FIRST_WINDOW_SEC if chase_detected else 0.0,
+                police_alert=police_detected,
+                police_lane=police_lane,
+                police_time_left=5.0 if police_detected else 0.0,
                 game_over_reason="",
                 tokens=tokens,
                 obstacles=(),  # Phase-1 token game has no obstacles per se
                 perception_healthy=True,
                 golden_lane_active=golden_lane_active,
-                golden_lane_index=self._golden_banner_lane if golden_lane_active else -1,
+                golden_lane_index=self._golden_event_lane if golden_lane_active else -1,
                 golden_time_left=golden_time_left if golden_lane_active else 0.0,
                 golden_lane_passed=False,
                 gold_tokens_collected=getattr(self._latest_state, "gold_tokens_collected", 0),
@@ -1476,6 +1514,10 @@ class RealGameInterface(GameInterface):
                 cv2.putText(out, "WARN", (cx - 18, cy + bh // 2 + 18),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
+        # 5b. Vehicle detections (front overlay) so event perception is visible.
+        self._draw_detection(out, chasing_car, "CHASE", (255, 0, 255), cv2)
+        self._draw_detection(out, police_car, "POLICE", (255, 255, 0), cv2)
+
         # 6. Status bar (top)
         bar_h = 28
         cv2.rectangle(out, (0, 0), (w, bar_h), (28, 28, 28), -1)
@@ -1493,11 +1535,19 @@ class RealGameInterface(GameInterface):
         cv2.putText(out, status, (10, 19),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 1, cv2.LINE_AA)
 
+        chase_score = float(chasing_car.get("score", 0.0))
+        police_score = float(police_car.get("score", 0.0))
+        chase_det = "Y" if bool(chasing_car.get("detected", False)) else "N"
+        police_det = "Y" if bool(police_car.get("detected", False)) else "N"
+        det_line = f"CHASE:{chase_det}({chase_score:.2f})  POLICE:{police_det}({police_score:.2f})"
+        cv2.putText(out, det_line, (10, bar_h + 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
+
         if getattr(cached_state, "golden_lane_active", False):
             lane_idx = getattr(cached_state, "golden_lane_index", -1)
             time_left = getattr(cached_state, "golden_time_left", 0.0)
             msg = f"GOLDEN LANE: L{lane_idx + 1} ({time_left:.1f}s)"
-            cv2.putText(out, msg, (10, bar_h + 22),
+            cv2.putText(out, msg, (10, bar_h + 46),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 215, 255), 2, cv2.LINE_AA)
             own_lane = getattr(cached_state, "own_lane", -1)
             if 0 <= own_lane < config.NUM_LANES and 0 <= lane_idx < config.NUM_LANES:
@@ -1507,13 +1557,13 @@ class RealGameInterface(GameInterface):
                     hint = "GO LEFT"
                 else:
                     hint = "ON GOLDEN LANE"
-                cv2.putText(out, hint, (10, bar_h + 48),
+                cv2.putText(out, hint, (10, bar_h + 72),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
         if self._golden_banner_text:
-            cv2.putText(out, f"OCR: {self._golden_banner_text}", (10, bar_h + 74),
+            cv2.putText(out, f"OCR: {self._golden_banner_text}", (10, bar_h + 98),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         if self._golden_ocr_status:
-            cv2.putText(out, f"OCR_STATUS: {self._golden_ocr_status}", (10, bar_h + 96),
+            cv2.putText(out, f"OCR_STATUS: {self._golden_ocr_status}", (10, bar_h + 120),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 255), 1, cv2.LINE_AA)
         if getattr(cached_state, "tactical_win", False):
             cv2.putText(out, "TACTICAL VICTORY", (w // 2 - 120, h // 2),
@@ -1634,6 +1684,12 @@ class RealGameInterface(GameInterface):
         """
         if getattr(cached_state, "brightness", 1.0) < config.LOW_LIGHT_THRESHOLD:
             return "LOW_LIGHT"
+        if getattr(cached_state, "police_alert", False):
+            lane_idx = getattr(cached_state, "police_lane", -1)
+            return f"POLICE_L{lane_idx + 1}" if lane_idx >= 0 else "POLICE"
+        if getattr(cached_state, "rear_chase_active", False):
+            lane_idx = getattr(cached_state, "rear_chase_lane", -1)
+            return f"CHASE_L{lane_idx + 1}" if lane_idx >= 0 else "CHASE"
         if getattr(cached_state, "golden_lane_active", False):
             lane_idx = getattr(cached_state, "golden_lane_index", -1)
             return f"GOLDEN_L{lane_idx + 1}"
@@ -1705,7 +1761,14 @@ class RealGameInterface(GameInterface):
                         self._golden_lane_seen_at = now
                         self._golden_banner_lane = lane - 1
                         self._golden_banner_text = text
-                        self._golden_banner_time_left = self._extract_seconds_left(text)
+                        parsed_left = self._extract_seconds_left(text)
+                        self._golden_banner_time_left = parsed_left
+                        # Latch event until timeout so control remains stable if
+                        # OCR skips a few frames.
+                        self._golden_event_active = True
+                        self._golden_event_lane = lane - 1
+                        ttl = parsed_left if parsed_left > 0.0 else config.GOLDEN_LANE_WINDOW_SEC
+                        self._golden_event_expires_at = max(self._golden_event_expires_at, now + ttl)
                         self._golden_ocr_status = "ok"
                 else:
                     self._golden_banner_text = text

@@ -5,19 +5,61 @@ and to cite in the report. Keep this file free of imports from other
 project modules so it can be loaded by every component without cycles.
 """
 
+import os
+
 # ----------------------------------------------------------------------
 # RTOS task parameters (uC/OS-II convention: smaller number = higher priority)
 # ----------------------------------------------------------------------
-# Periods are in seconds. Deadline defaults to period (implicit-deadline tasks).
-TASK_WATCHDOG_PERIOD   = 0.020   # 20 ms
-TASK_PERCEPTION_PERIOD = 0.020   # 20 ms
-TASK_ACTUATION_PERIOD  = 0.030   # 30 ms
-TASK_DECISION_PERIOD   = 0.050   # 50 ms
+# Switch quickly during testing:
+#   1) Edit RTOS_PROFILE below, or
+#   2) Override at runtime: set RTOS_PROFILE=safe|fast
+#      (PowerShell example: $env:RTOS_PROFILE = "fast")
+RTOS_PROFILE = os.getenv("RTOS_PROFILE", "fast").strip().lower()
 
-TASK_WATCHDOG_PRIORITY   = 1
-TASK_PERCEPTION_PRIORITY = 2
-TASK_ACTUATION_PRIORITY  = 3
-TASK_DECISION_PRIORITY   = 4
+# Periods are in seconds. Deadline defaults to period (implicit-deadline tasks).
+# SAFE: conservative baseline for stability-focused runs.
+_RTOS_PROFILE_SAFE = {
+	"TASK_WATCHDOG_PERIOD": 0.020,   # 20 ms
+	"TASK_PERCEPTION_PERIOD": 0.020, # 20 ms
+	"TASK_ACTUATION_PERIOD": 0.030,  # 30 ms
+	"TASK_DECISION_PERIOD": 0.050,   # 50 ms
+	"TASK_WATCHDOG_PRIORITY": 1,
+	"TASK_PERCEPTION_PRIORITY": 2,
+	"TASK_ACTUATION_PRIORITY": 3,
+	"TASK_DECISION_PRIORITY": 4,
+}
+
+# FAST: lower control latency while preserving decision logic.
+_RTOS_PROFILE_FAST = {
+	"TASK_WATCHDOG_PERIOD": 0.020,   # 20 ms
+	"TASK_PERCEPTION_PERIOD": 0.020, # 20 ms
+	"TASK_ACTUATION_PERIOD": 0.020,  # 20 ms
+	"TASK_DECISION_PERIOD": 0.040,   # 40 ms
+	"TASK_WATCHDOG_PRIORITY": 1,
+	"TASK_PERCEPTION_PRIORITY": 2,
+	"TASK_DECISION_PRIORITY": 3,
+	"TASK_ACTUATION_PRIORITY": 4,
+}
+
+_RTOS_PROFILES = {
+	"safe": _RTOS_PROFILE_SAFE,
+	"fast": _RTOS_PROFILE_FAST,
+}
+
+if RTOS_PROFILE not in _RTOS_PROFILES:
+	RTOS_PROFILE = "safe"
+
+_RTOS_ACTIVE = _RTOS_PROFILES[RTOS_PROFILE]
+
+TASK_WATCHDOG_PERIOD = _RTOS_ACTIVE["TASK_WATCHDOG_PERIOD"]
+TASK_PERCEPTION_PERIOD = _RTOS_ACTIVE["TASK_PERCEPTION_PERIOD"]
+TASK_ACTUATION_PERIOD = _RTOS_ACTIVE["TASK_ACTUATION_PERIOD"]
+TASK_DECISION_PERIOD = _RTOS_ACTIVE["TASK_DECISION_PERIOD"]
+
+TASK_WATCHDOG_PRIORITY = _RTOS_ACTIVE["TASK_WATCHDOG_PRIORITY"]
+TASK_PERCEPTION_PRIORITY = _RTOS_ACTIVE["TASK_PERCEPTION_PRIORITY"]
+TASK_ACTUATION_PRIORITY = _RTOS_ACTIVE["TASK_ACTUATION_PRIORITY"]
+TASK_DECISION_PRIORITY = _RTOS_ACTIVE["TASK_DECISION_PRIORITY"]
 
 # Command queue depth. Kept small on purpose: a fresh command should
 # supersede a stale one, not pile up behind it.
@@ -62,9 +104,16 @@ SWITCH_MARGIN = 0.16
 #           be collected only when the lane is otherwise clean and the
 #           green benefit is clear.
 #   Green:  the only positive contributor.
-GREEN_REWARD   = 3.0
-RED_PENALTY    = 20.0
-YELLOW_PENALTY = 18.0
+GREEN_REWARD   = 6.0
+RED_PENALTY    = 30.0
+YELLOW_PENALTY = 10.0
+
+# Cost-policy shaping terms (normal mode).
+# Lower lane/stability costs make the controller more willing to move
+# for cleaner, greener lanes without changing event override logic.
+COST_LANE_CHANGE = 0.45
+COST_STABILITY_LANE = 0.12
+COST_CENTER_LANE = 0.04
 
 # ----------------------------------------------------------------------
 # Challenge 1: low-light handling
@@ -172,7 +221,9 @@ ROI_X_FRAC = (0.15, 0.85)
 
 # Real-game token / vehicle / overlay tuning.
 REAL_GAME_TOKEN_DETECTION_HZ = 25.0
-REAL_GAME_VEHICLE_DETECTION_HZ = 4.0
+REAL_GAME_VEHICLE_DETECTION_HZ = 8.0
+REAL_GAME_CHASE_DETECTION_THRESHOLD = 0.62
+REAL_GAME_POLICE_DETECTION_THRESHOLD = 0.62
 REAL_GAME_GOLDEN_OCR_HZ = 3.0
 REAL_GAME_GOLDEN_OCR_STALE_SEC = 1.5
 REAL_GAME_OVERLAY_FPS = 8.0
