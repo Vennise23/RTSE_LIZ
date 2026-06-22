@@ -17,6 +17,7 @@ import numpy as np
 
 import comms
 import rtos
+from rtos_control import config
 from rtos import shared_data, data_lock
 
 
@@ -109,7 +110,7 @@ def read_back_camera_task():
 
 
 # ---------------------------------------------------------
-# Token detection (UNCHANGED CORE LOGIC)
+# Token detection
 # ---------------------------------------------------------
 def detect_tokens(frame):
     detected_tokens = []
@@ -123,17 +124,14 @@ def detect_tokens(frame):
     roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-    # Ranges widened from live token samples: the game's tokens are vivid but
-    # pastel — pink "red" tokens sit at H~11 (just past the old H<=10 cut) and
-    # gold "yellow" tokens at H~18 (just below the old H>=20 cut), so both were
-    # being missed. The background is blue (H~120) and the road is grey (low
-    # S), so a lower S/V floor is safe and only adds real tokens.
+    # Tighten green the most because we want to prioritize it and avoid
+    # mistaking grass/road highlights for collectible tokens.
     color_ranges = {
-        'green': [(np.array([38, 70, 70]), np.array([90, 255, 255]))],
-        'yellow': [(np.array([16, 80, 80]), np.array([34, 255, 255]))],
+        'green': [(np.array([38, 90, 75]), np.array([82, 255, 255]))],
+        'yellow': [(np.array([20, 80, 80]), np.array([38, 255, 255]))],
         'red': [
-            (np.array([0, 70, 70]), np.array([15, 255, 255])),
-            (np.array([168, 70, 70]), np.array([180, 255, 255]))
+            (np.array([0, 90, 70]), np.array([12, 255, 255])),
+            (np.array([168, 90, 70]), np.array([180, 255, 255]))
         ],
     }
 
@@ -148,18 +146,32 @@ def detect_tokens(frame):
 
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.GaussianBlur(mask, (5, 5), 0)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < 180 or area > 8000:   # lower floor -> see far tokens sooner
+            if area < 240 or area > 9000:
                 continue
 
             x, y, w, h = cv2.boundingRect(contour)
             aspect_ratio = w / float(h)
 
-            if aspect_ratio < 0.6 or aspect_ratio > 1.6:
+            if aspect_ratio < 0.55 or aspect_ratio > 1.9:
+                continue
+
+            # Token discs are roughly circular, so reject long/skinny blobs.
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter <= 0:
+                continue
+
+            circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+            if color == 'green' and circularity < 0.58:
+                continue
+            if color == 'yellow' and circularity < 0.50:
+                continue
+            if color == 'red' and circularity < 0.48:
                 continue
 
             x += roi_x1
@@ -514,60 +526,8 @@ def processing_task():
 
     lane_centers = processing_task.cached_lane_centers
 
-    # simple fallback
-    current_lane = 2 if len(lane_centers) == 0 else 2
-
-    # -----------------------------
-    # 6b. V3.0 EVENT DETECTION
-    # -----------------------------
-    n_lanes = len(lane_centers) if len(lane_centers) > 0 else 5
-
-    # EV1 Darkness — brightness with hysteresis so it doesn't chatter.
-    bright = frame_brightness(front_frame)
-    if processing_task.dark:
-        if bright > DARK_BRIGHTNESS_OFF:
-            processing_task.dark = False
-    else:
-        if bright < DARK_BRIGHTNESS_ON:
-            processing_task.dark = True
-    darkness = processing_task.dark
-
-    # EV5 Golden Lane — lane dominated by green tokens.
-    golden_lane = detect_golden_lane(detected_tokens, lane_centers)
-
-    # EV2 police cop is AHEAD (front camera); EV3/EV4 chasing cars are BEHIND.
-    # Vehicle CV is heavier, so it runs at ~6 FPS to protect the 40ms deadline;
-    # the 5s event windows are far longer than this latency.
-    if now - processing_task.last_threat_time > 0.15:
-        processing_task.last_threat_time = now
-        with data_lock:
-            back_frame = shared_data.get('latest_back_frame')
-        if ENABLE_POLICE_CV:
-            processing_task.cached_police, processing_task.cached_cop_lane = \
-                detect_police_front(front_frame, lane_centers)
-        else:
-            processing_task.cached_police, processing_task.cached_cop_lane = False, -1
-        if ENABLE_CHASING_CV:
-            processing_task.cached_rear_lane = detect_chasing_rear(back_frame, n_lanes)
-        else:
-            processing_task.cached_rear_lane = -1
-    police = processing_task.cached_police
-    cop_lane = processing_task.cached_cop_lane
-    rear_lane = processing_task.cached_rear_lane
-
-    # EV1..EV5 pass tracker (cheap, every detect tick). Latch to PASSED: a
-    # label only ever turns green->stays green, so we never clear a True.
-    ev_raw = read_event_tracker(front_frame)
-    for idx, v in enumerate(ev_raw):
-        if v == 1:
-            processing_task.events_passed[idx] = True
-    events_passed = list(processing_task.events_passed)
-
-    # Crude token-flow counter for the operator HUD (best effort).
-    green_total = sum(1 for t in detected_tokens if t['color'] == 'green')
-    if green_total < processing_task.prev_green_total:
-        processing_task.green_seen += (processing_task.prev_green_total - green_total)
-    processing_task.prev_green_total = green_total
+    # Fallback: assume the center lane when lane detection is unavailable.
+    current_lane = config.LANE_CENTER_INDEX
 
     # -----------------------------
     # 7. WRITE BACK SHARED DATA

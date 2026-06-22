@@ -5,19 +5,61 @@ and to cite in the report. Keep this file free of imports from other
 project modules so it can be loaded by every component without cycles.
 """
 
+import os
+
 # ----------------------------------------------------------------------
 # RTOS task parameters (uC/OS-II convention: smaller number = higher priority)
 # ----------------------------------------------------------------------
-# Periods are in seconds. Deadline defaults to period (implicit-deadline tasks).
-TASK_WATCHDOG_PERIOD   = 0.020   # 20 ms
-TASK_PERCEPTION_PERIOD = 0.020   # 20 ms
-TASK_ACTUATION_PERIOD  = 0.030   # 30 ms
-TASK_DECISION_PERIOD   = 0.050   # 50 ms
+# Switch quickly during testing:
+#   1) Edit RTOS_PROFILE below, or
+#   2) Override at runtime: set RTOS_PROFILE=safe|fast
+#      (PowerShell example: $env:RTOS_PROFILE = "fast")
+RTOS_PROFILE = os.getenv("RTOS_PROFILE", "fast").strip().lower()
 
-TASK_WATCHDOG_PRIORITY   = 1
-TASK_PERCEPTION_PRIORITY = 2
-TASK_ACTUATION_PRIORITY  = 3
-TASK_DECISION_PRIORITY   = 4
+# Periods are in seconds. Deadline defaults to period (implicit-deadline tasks).
+# SAFE: conservative baseline for stability-focused runs.
+_RTOS_PROFILE_SAFE = {
+	"TASK_WATCHDOG_PERIOD": 0.020,   # 20 ms
+	"TASK_PERCEPTION_PERIOD": 0.020, # 20 ms
+	"TASK_ACTUATION_PERIOD": 0.030,  # 30 ms
+	"TASK_DECISION_PERIOD": 0.050,   # 50 ms
+	"TASK_WATCHDOG_PRIORITY": 1,
+	"TASK_PERCEPTION_PRIORITY": 2,
+	"TASK_ACTUATION_PRIORITY": 3,
+	"TASK_DECISION_PRIORITY": 4,
+}
+
+# FAST: lower control latency while preserving decision logic.
+_RTOS_PROFILE_FAST = {
+	"TASK_WATCHDOG_PERIOD": 0.020,   # 20 ms
+	"TASK_PERCEPTION_PERIOD": 0.020, # 20 ms
+	"TASK_ACTUATION_PERIOD": 0.020,  # 20 ms
+	"TASK_DECISION_PERIOD": 0.040,   # 40 ms
+	"TASK_WATCHDOG_PRIORITY": 1,
+	"TASK_PERCEPTION_PRIORITY": 2,
+	"TASK_DECISION_PRIORITY": 3,
+	"TASK_ACTUATION_PRIORITY": 4,
+}
+
+_RTOS_PROFILES = {
+	"safe": _RTOS_PROFILE_SAFE,
+	"fast": _RTOS_PROFILE_FAST,
+}
+
+if RTOS_PROFILE not in _RTOS_PROFILES:
+	RTOS_PROFILE = "safe"
+
+_RTOS_ACTIVE = _RTOS_PROFILES[RTOS_PROFILE]
+
+TASK_WATCHDOG_PERIOD = _RTOS_ACTIVE["TASK_WATCHDOG_PERIOD"]
+TASK_PERCEPTION_PERIOD = _RTOS_ACTIVE["TASK_PERCEPTION_PERIOD"]
+TASK_ACTUATION_PERIOD = _RTOS_ACTIVE["TASK_ACTUATION_PERIOD"]
+TASK_DECISION_PERIOD = _RTOS_ACTIVE["TASK_DECISION_PERIOD"]
+
+TASK_WATCHDOG_PRIORITY = _RTOS_ACTIVE["TASK_WATCHDOG_PRIORITY"]
+TASK_PERCEPTION_PRIORITY = _RTOS_ACTIVE["TASK_PERCEPTION_PRIORITY"]
+TASK_ACTUATION_PRIORITY = _RTOS_ACTIVE["TASK_ACTUATION_PRIORITY"]
+TASK_DECISION_PRIORITY = _RTOS_ACTIVE["TASK_DECISION_PRIORITY"]
 
 # Command queue depth. Kept small on purpose: a fresh command should
 # supersede a stale one, not pile up behind it.
@@ -26,8 +68,8 @@ COMMAND_QUEUE_MAX = 8
 # ----------------------------------------------------------------------
 # Game / world model
 # ----------------------------------------------------------------------
-NUM_LANES = 3                # 0 = left, 1 = center, 2 = right
-LANE_CENTER_INDEX = 1
+NUM_LANES = 5                # 0 = leftmost, 2 = center, 4 = rightmost
+LANE_CENTER_INDEX = 2
 DISTANCE_HORIZON = 1.0       # normalized distance ahead the perception reports
 TOKEN_REACHED_DISTANCE = 0.05  # tokens closer than this are considered consumed/missed
 
@@ -51,23 +93,27 @@ LOOKAHEAD_SPEED_GAIN = 0.40    # extra look-ahead per unit of normalized speed
 SWITCH_COOLDOWN = 0.15
 
 # Minimum reward advantage required to justify a discretionary lane change.
-# Acts as hysteresis around the chosen lane. With reds/yellows weighted
-# 20x the green reward, even tiny differences in red exposure dominate
-# this threshold, so we can keep it small.
-SWITCH_MARGIN = 0.15
+# Slightly relaxed so clean green lanes win more often.
+SWITCH_MARGIN = 0.16
 
 # Reward / penalty weights.
 #   Red:    must dominate everything — 20x green reward. Triggers the
 #           SAFETY branch (emergency lane change) the moment it appears
 #           within BRAKE_DIST in the current lane.
-#   Yellow: undesirable but NOT worth losing a green for. Weight 2x
-#           green reward, and it does NOT trigger the SAFETY branch on
-#           its own. A lane with only-yellow is avoided; a lane with
-#           green-then-yellow is still preferred over an empty one.
+#   Yellow: undesirable and usually not worth a lane change. It should
+#           be collected only when the lane is otherwise clean and the
+#           green benefit is clear.
 #   Green:  the only positive contributor.
-GREEN_REWARD   = 3.0
-RED_PENALTY    = 20.0
-YELLOW_PENALTY = 18.0
+GREEN_REWARD   = 6.0
+RED_PENALTY    = 30.0
+YELLOW_PENALTY = 10.0
+
+# Cost-policy shaping terms (normal mode).
+# Lower lane/stability costs make the controller more willing to move
+# for cleaner, greener lanes without changing event override logic.
+COST_LANE_CHANGE = 0.45
+COST_STABILITY_LANE = 0.12
+COST_CENTER_LANE = 0.04
 
 # ----------------------------------------------------------------------
 # Challenge 1: low-light handling
@@ -118,6 +164,16 @@ POLICE_CAR_REQUIRED_TOKEN_COLOR = "red"
 POLICE_CAR_SPEED_PENALTY_FACTOR = 0.5
 
 # ----------------------------------------------------------------------
+# Challenge 4: golden lane / tactical victory
+# ----------------------------------------------------------------------
+GOLDEN_LANE_MIN_APPEAR_SEC = 10.0
+GOLDEN_LANE_MAX_APPEAR_SEC = 55.0
+GOLDEN_LANE_WINDOW_SEC = 5.0
+GOLDEN_LANE_MIN_LENGTH_SEC = 5.0
+TACTICAL_GREEN_GOAL = 60
+TACTICAL_REQUIRED_EVENT_PASSES = 5
+
+# ----------------------------------------------------------------------
 # Actuation calibration (rule-based mapping from lane decision -> floats)
 # ----------------------------------------------------------------------
 # steering_input domain is [-1.0, +1.0] (left .. right) for the real game.
@@ -156,8 +212,8 @@ GAME_CONTROL_HOST = "127.0.0.1"
 GAME_CONTROL_PORT = 8081
 
 # Lane boundaries as fractions of the front-camera frame width.
-# The road in SpeedTrials2D occupies roughly the middle 70 %; split into thirds.
-LANE_X_BOUNDS_FRAC = (0.15, 0.38, 0.62, 0.85)  # 4 edges -> 3 lanes
+# The road in SpeedTrials2D occupies roughly the middle 70 %; split into five lanes.
+LANE_X_BOUNDS_FRAC = (0.15, 0.29, 0.43, 0.57, 0.71, 0.85)  # 6 edges -> 5 lanes
 
 # Vertical region of interest for token detection (fractions of frame height).
 ROI_Y_FRAC = (0.05, 0.70)
@@ -165,12 +221,21 @@ ROI_X_FRAC = (0.15, 0.85)
 
 # Real-game token / vehicle / overlay tuning.
 REAL_GAME_TOKEN_DETECTION_HZ = 25.0
-REAL_GAME_VEHICLE_DETECTION_HZ = 4.0
+REAL_GAME_VEHICLE_DETECTION_HZ = 8.0
+REAL_GAME_CHASE_DETECTION_THRESHOLD = 0.62
+REAL_GAME_POLICE_DETECTION_THRESHOLD = 0.62
+REAL_GAME_GOLDEN_OCR_HZ = 3.0
+REAL_GAME_GOLDEN_OCR_STALE_SEC = 1.5
 REAL_GAME_OVERLAY_FPS = 8.0
 REAL_GAME_TEMPLATE_SCALES = (1.2, 1.0, 0.8)
 REAL_GAME_MAX_FRAME_WIDTH = 960
 REAL_GAME_REAR_VEHICLE_ROI_X_FRAC = (0.15, 0.85)
 REAL_GAME_REAR_VEHICLE_ROI_Y_FRAC = (0.35, 0.95)
 
+# OCR crop for the exe golden-lane banner, expressed as fractions of the
+# window size. Tweak these if the banner position changes.
+REAL_GAME_GOLDEN_OCR_X_FRAC = (0.30, 0.82)
+REAL_GAME_GOLDEN_OCR_Y_FRAC = (0.03, 0.12)
+
 # Mock-mode default duration (seconds). Real-mode runs until Ctrl+C.
-MOCK_RUN_SECONDS_DEFAULT = 20.0
+MOCK_RUN_SECONDS_DEFAULT = 180.0

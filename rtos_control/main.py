@@ -34,7 +34,7 @@ def _parse_args(argv) -> argparse.Namespace:
     p.add_argument("--mode", choices=["mock", "real"], default="mock",
                    help="Which GameInterface implementation to use.")
     p.add_argument("--seconds", type=float, default=None,
-                   help="Run duration. Default: mock=20s, real=until Ctrl+C.")
+                   help="Run duration. Default: mock=180s, real=until Ctrl+C.")
     p.add_argument("--seed", type=int, default=42,
                    help="Mock world RNG seed (mock mode only).")
     p.add_argument("--no-overlay", action="store_true",

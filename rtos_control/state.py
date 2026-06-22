@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import List, Optional
 
+from . import config
 
 # ----------------------------------------------------------------------
 # Value objects (immutable on the wire — copy on read, never mutate in place)
@@ -57,6 +58,14 @@ class GameState:
     police_alert: bool = False       # challenge 3 active flag
     police_lane: int = -1           # lane of the police car, -1 when inactive
     police_time_left: float = 0.0   # seconds left before the police challenge expires
+    golden_lane_active: bool = False # golden lane event flag
+    golden_lane_index: int = -1      # lane index that is golden, -1 when inactive
+    golden_time_left: float = 0.0    # seconds left before golden lane expires
+    golden_lane_passed: bool = False # whether player was in the golden lane at expiry
+    gold_tokens_collected: int = 0    # cumulative green tokens collected
+    red_tokens_collected: int = 0     # cumulative red tokens collected
+    event_pass_count: int = 0         # how many required events were passed
+    tactical_win: bool = False       # tactical victory flag
     game_over: bool = False          # set True when the police car collides with the player
     game_over_reason: str = ""
     tokens: tuple = ()               # tuple[Token, ...]
@@ -67,7 +76,7 @@ class GameState:
     def empty() -> "GameState":
         return GameState(
             timestamp=time.perf_counter(),
-            own_lane=1,
+            own_lane=config.LANE_CENTER_INDEX,
             speed_norm=0.0,
             brightness=1.0,
             low_light_active=False,
@@ -78,6 +87,14 @@ class GameState:
             police_alert=False,
             police_lane=-1,
             police_time_left=0.0,
+            golden_lane_active=False,
+            golden_lane_index=-1,
+            golden_time_left=0.0,
+            golden_lane_passed=False,
+            gold_tokens_collected=0,
+            red_tokens_collected=0,
+            event_pass_count=0,
+            tactical_win=False,
             game_over=False,
             game_over_reason="",
             tokens=(),
@@ -135,7 +152,7 @@ class SharedState:
         self._perception_misses: int = 0
         # Actuation reports the last commanded lane so Decision knows the
         # target it asked for (vs perception's measurement of where we are).
-        self._last_target_lane: int = 1
+        self._last_target_lane: int = config.LANE_CENTER_INDEX
         self._last_target_set_at: float = 0.0
         # Watchdog raises this flag when the system is degraded so Decision
         # can short-circuit risky moves until perception recovers.

@@ -68,8 +68,85 @@ def nearest_safe_lane(current, red, n, avoid=-1):
     return min(candidates, key=lambda i: abs(i - current))
 
 
-def safe_corridor_score(i, red, n):
-    """How many lanes wide the red-free corridor around lane i is."""
+def lane_red_distance(i, red, n):
+    """Return the distance in lanes to the nearest red token lane."""
+    if not any(red.values()):
+        return n
+
+    distances = [abs(i - j) for j in range(n) if red[j]]
+    return min(distances) if distances else n
+
+
+def is_red_danger_zone(i, red, n):
+    """Hard block lanes that are red or directly adjacent to red."""
+    if red[i]:
+        return True
+    if i > 0 and red[i - 1]:
+        return True
+    if i < n - 1 and red[i + 1]:
+        return True
+    return False
+
+
+# =========================
+# GREEN-FIRST TARGETING
+# =========================
+def lane_token_score(tokens, lane_centers, frame_h, color, current_lane=None):
+    score = {i: 0.0 for i in range(len(lane_centers))}
+
+    for t in tokens:
+        if t['color'] != color:
+            continue
+
+        li = lane_of(t['x'], lane_centers)
+        dist = max(frame_h - t['y'], 20)
+        proximity = 1.0 / dist
+
+        # Prefer tokens that are lower on screen and closer to our current lane.
+        lateral_bias = 1.0
+        if current_lane is not None:
+            lateral_bias = 1.0 / (1.0 + abs(li - current_lane) * 0.65)
+
+        if color == 'green':
+            score[li] += proximity * 5.0 * lateral_bias
+        elif color == 'yellow':
+            score[li] += proximity * 1.6 * lateral_bias
+        elif color == 'red':
+            score[li] += proximity * 0.15 * lateral_bias
+
+    return score
+
+
+# =========================
+# DECISION ENGINE (FAST SAFETY FIRST)
+# =========================
+def lane_risk_score(i, red, yellow, n):
+
+    # HARD BLOCK
+    if is_red_danger_zone(i, red, n):
+        return 1e9
+
+    risk = 0
+
+    # local danger
+    red_dist = lane_red_distance(i, red, n)
+    risk += max(0, 4 - red_dist) * 250
+
+    # trap pattern detection (RRV / RRVVV)
+    if i > 0 and i < n - 1:
+        if red[i - 1] and red[i + 1]:
+            risk += 1200
+
+    # yellow weak penalty
+    if yellow[i]:
+        risk += 120
+
+    return risk
+
+
+def safe_corridor_score(i, red, yellow, n):
+
+    # how long can we move forward without hitting red
     width = 1
     k = i - 1
     while k >= 0 and not red[k]:
@@ -137,77 +214,85 @@ def nearest_red_lane(tokens, lane_centers, current_lane, frame_h, avoid_lane):
     return best_lane
 
 
-# =========================
-# TACTICAL DECISION ENGINE
-# =========================
-def decide(tokens, lane_centers, current_lane, frame_h, ev):
-    """Return (target_lane, reason). Darkness is handled by the caller."""
-    n = len(lane_centers)
-    if n == 0:
-        return -1, "no_lane"
+    green_scores = lane_token_score(forward, lane_centers, frame_h, 'green', current_lane)
+    yellow_scores = lane_token_score(forward, lane_centers, frame_h, 'yellow', current_lane)
 
-    red, yellow, green_score = build_lane_maps(tokens, lane_centers, frame_h)
-
-    cop_lane = ev['police_lane'] if ev['police'] else -1
-    golden = ev['golden_lane']
-    rear = ev['rear_lane']
-
-    # ---------------------------------------------------------------
-    # EV2 POLICE — grab a red within 5s, NEVER enter the cop's lane.
-    # ---------------------------------------------------------------
-    if ev['police']:
-        # If the cop is sitting in our lane, getting out is non-negotiable.
-        target = nearest_red_lane(tokens, lane_centers, current_lane, frame_h, cop_lane)
-        if target < 0:
-            # No red visible yet: hold a safe lane (not the cop's) and wait for
-            # one to scroll in, keeping out of the kill lane.
-            target = nearest_safe_lane(current_lane, red, n, avoid=cop_lane)
-            return target, "EV2_POLICE_WAIT_RED"
-        return target, "EV2_POLICE_TAKE_RED"
-
-    # ---------------------------------------------------------------
-    # EV3/EV4 CHASING — car behind in our lane -> dodge to a DIFFERENT lane.
-    # ---------------------------------------------------------------
-    if rear == current_lane and rear >= 0:
-        cands = [i for i in range(n)
-                 if not red[i] and i != current_lane and i != cop_lane]
-        if not cands:
-            cands = [i for i in range(n) if not red[i] and i != current_lane]
-        if cands:
-            return min(cands, key=lambda i: abs(i - current_lane)), "EV34_CHASING_DODGE"
-        # boxed in by reds on both sides: hold and let speed model cope
-        return current_lane, "EV34_CHASING_BOXED"
-
-    # ---------------------------------------------------------------
-    # EV5 GOLDEN — lock onto the golden lane and hold until it expires.
-    # ---------------------------------------------------------------
-    if golden >= 0 and golden < n and not red[golden]:
-        return golden, "EV5_GOLDEN_HOLD"
-
-    # ---------------------------------------------------------------
-    # SAFETY — never sit on a red, escape RRV traps fast.
-    # ---------------------------------------------------------------
+    # =========================
+    # EMERGENCY (NO DISCUSSION)
+    # =========================
     if red[current_lane]:
         return nearest_safe_lane(current_lane, red, n, avoid=cop_lane), "EMERGENCY_RED"
     if is_trapped(current_lane, red, n):
         return nearest_safe_lane(current_lane, red, n, avoid=cop_lane), "TRAP_ESCAPE"
 
-    # ---------------------------------------------------------------
-    # TACTICAL GREEN — score lanes: chase green, keep a wide safe corridor,
-    # punish reds/yellows, prefer not to zig-zag, never touch the cop lane.
-    # ---------------------------------------------------------------
-    best_lane, best_score = current_lane, -1e9
+    # =========================
+    # GREEN FIRST
+    # =========================
+    best_green_lane = -1
+    best_green_score = 0.0
     for i in range(n):
-        if red[i]:
+        if is_red_danger_zone(i, red, n):
             continue
-        score = 0.0
-        score += green_score[i] * 120.0           # PRIMARY: farm green (net +60)
-        score += safe_corridor_score(i, red, n) * 25.0
-        score -= abs(i - current_lane) * 30.0      # stability / anti-zigzag
+        score = green_scores[i]
+        score += lane_red_distance(i, red, n) * 0.25
+        if score > best_green_score:
+            best_green_score = score
+            best_green_lane = i
+
+    if best_green_lane != -1 and best_green_score >= 0.012:
+        return best_green_lane, f"CHASE_GREEN_{best_green_lane}"
+
+    # =========================
+    # YELLOW SECOND
+    # =========================
+    best_yellow_lane = -1
+    best_yellow_score = 0.0
+    for i in range(n):
+        if is_red_danger_zone(i, red, n):
+            continue
+        score = yellow_scores[i]
+        score += lane_red_distance(i, red, n) * 0.15
+        if score > best_yellow_score:
+            best_yellow_score = score
+            best_yellow_lane = i
+
+    if best_yellow_lane != -1 and best_yellow_score >= 0.011:
+        # Only take yellow if there is no strong green option.
+        return best_yellow_lane, f"CHASE_YELLOW_{best_yellow_lane}"
+
+    # =========================
+    # FALLBACK SAFE SEARCH
+    # =========================
+    best_lane = current_lane
+    best_score = -1e9
+
+    for i in range(n):
+        risk = lane_risk_score(i, red, yellow, n)
+        if risk > 0:
+            continue  # avoid dangerous lanes
+
+        corridor = safe_corridor_score(i, red, yellow, n)
+
+        score = 0
+        score += corridor * 120
+        score += lane_red_distance(i, red, n) * 140
+
+        # If we already saw some green elsewhere, gently bias toward it.
+        score += green_scores[i] * 900
+
+        # stability (avoid zigzag)
+        score -= abs(i - current_lane) * 35
+
+        # slight center preference
+        score -= abs(i - n//2) * 10
+
+        # yellow penalty
         if yellow[i]:
-            score -= 120.0
-        if i == cop_lane:
-            score -= 1e6                            # hard-avoid the cop lane
+            score -= 260
+
+        # stay far from any red cluster even when falling back
+        score += lane_red_distance(i, red, n) * 60
+
         if score > best_score:
             best_score, best_lane = score, i
     return best_lane, "TACTICAL_GREEN"
@@ -290,22 +375,23 @@ def driving_logic_task():
 
     target, reason = decide(tokens, lane_centers, current_lane, h, ev)
 
-    # ===============================================================
-    # FAST LANE LOCK (anti-jitter, but reacts in <=3 ticks)
-    # ===============================================================
-    # Event lanes (police/golden/dodge) must take effect immediately — only the
-    # ordinary green-farming target gets the hysteresis lock.
-    instant = reason in ("EV2_POLICE_TAKE_RED", "EV2_POLICE_WAIT_RED",
-                         "EV34_CHASING_DODGE", "EV5_GOLDEN_HOLD",
-                         "EMERGENCY_RED", "TRAP_ESCAPE")
-    if instant or _lane_lock == -1:
+    # =========================
+    # FAST LANE LOCK (GREEN CAN PREEMPT)
+    # =========================
+    if _lane_lock == -1:
         _lane_lock = target
-        _lock_counter = 0
     elif target == _lane_lock:
+        _lock_counter = 0
+    elif target >= 0 and (
+        "CHASE_GREEN" in reason
+        or "EMERGENCY_RED" in reason
+        or "TRAP_ESCAPE" in reason
+    ):
+        _lane_lock = target
         _lock_counter = 0
     else:
         _lock_counter += 1
-        if _lock_counter > 2:
+        if _lock_counter > 1:  # faster reaction, less stickiness
             _lane_lock = target
             _lock_counter = 0
 
